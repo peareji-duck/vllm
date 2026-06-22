@@ -16,7 +16,7 @@ via Gemma4MultimodalEmbedder.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from types import SimpleNamespace
 from typing import Any
 
@@ -26,8 +26,15 @@ from torch import nn
 from torch.nn import functional as F
 from transformers import AutoModel
 
+import vllm._custom_ops as ops
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed import (
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
+)
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -61,6 +68,20 @@ from .interfaces import (
 )
 
 logger = init_logger(__name__)
+
+_DIFFUSION_GEMMA_LOCAL_VOCAB_SAMPLER = (
+    envs.VLLM_DIFFUSION_GEMMA_LOCAL_VOCAB_SAMPLER
+)
+_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE = (
+    envs.VLLM_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE
+)
+_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE_TP_STATE = (
+    envs.VLLM_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE_TP_STATE
+)
+_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE_MODE_FLAGS = (
+    envs.VLLM_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE_MODE_FLAGS
+)
+_DIFFUSION_GEMMA_FLASHDENOISE_SEED = 0xD1FF600D
 
 
 class DiffusionGemmaSelfConditioning(nn.Module):
@@ -127,6 +148,19 @@ def _softcap_logits(logits: torch.Tensor, cap: float) -> torch.Tensor:
     # the [num_tokens, vocab] logits instead of four separate passes.
     logits = logits.float()
     return torch.tanh(logits / cap) * cap
+
+
+def _compute_local_lm_head_logits(
+    lm_head: ParallelLMHead,
+    hidden_states: torch.Tensor,
+    *,
+    final_logit_softcapping: float | None,
+    embedding_bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
+    if final_logit_softcapping is not None:
+        logits = _softcap_logits(logits, final_logit_softcapping)
+    return logits
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -328,9 +362,16 @@ class DiffusionGemmaForConditionalGeneration(
         )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
-        logits = self.logits_processor(self.lm_head, hidden_states)
-        if logits is not None and self.final_logit_softcapping is not None:
-            logits = _softcap_logits(logits, self.final_logit_softcapping)
+        if _DIFFUSION_GEMMA_LOCAL_VOCAB_SAMPLER:
+            logits = _compute_local_lm_head_logits(
+                self.lm_head,
+                hidden_states,
+                final_logit_softcapping=self.final_logit_softcapping,
+            )
+        else:
+            logits = self.logits_processor(self.lm_head, hidden_states)
+            if logits is not None and self.final_logit_softcapping is not None:
+                logits = _softcap_logits(logits, self.final_logit_softcapping)
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
@@ -451,6 +492,286 @@ class DiffusionGemmaForConditionalGeneration(
         raise ValueError(f"Unsupported modality: {modality}")
 
 
+def _vocab_parallel_soft_embed(
+    probs: torch.Tensor,
+    embed_weight: torch.Tensor,
+    normalizer: torch.Tensor,
+    *,
+    vocab_start_index: int,
+    vocab_end_index: int,
+    all_reduce_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Compute ``probs @ embed_weight`` for dense or vocab-sharded embeddings."""
+    full_vocab = probs.shape[-1]
+    local_vocab = embed_weight.shape[0]
+    if vocab_start_index < 0 or vocab_end_index < vocab_start_index:
+        raise ValueError(
+            f"invalid vocab shard range: [{vocab_start_index}, {vocab_end_index})"
+        )
+    if vocab_end_index > full_vocab:
+        raise ValueError(
+            f"vocab shard end {vocab_end_index} exceeds probs vocab {full_vocab}"
+        )
+
+    if (
+        vocab_start_index == 0
+        and vocab_end_index == full_vocab
+        and local_vocab == full_vocab
+    ):
+        soft_embeds = torch.matmul(probs.to(embed_weight.dtype), embed_weight)
+        return soft_embeds * normalizer
+
+    shard_width = vocab_end_index - vocab_start_index
+    if shard_width > local_vocab:
+        raise ValueError(
+            f"vocab shard width {shard_width} exceeds local weight rows {local_vocab}"
+        )
+
+    local_probs = probs[..., vocab_start_index:vocab_end_index]
+    local_weight = embed_weight[:shard_width]
+    soft_embeds = torch.matmul(local_probs.to(local_weight.dtype), local_weight)
+    if all_reduce_fn is not None:
+        soft_embeds = all_reduce_fn(soft_embeds)
+    return soft_embeds * normalizer
+
+
+def _local_vocab_softmax_stats(
+    scaled_logits: torch.Tensor,
+    embed_weight: torch.Tensor,
+    normalizer: torch.Tensor,
+    *,
+    local_vocab_width: int | None = None,
+    global_max: torch.Tensor | None = None,
+    all_reduce_sum_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    all_reduce_max_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exact softmax entropy and soft embed from local-vocab logits."""
+    if local_vocab_width is not None:
+        local_vocab_width = int(local_vocab_width)
+        if local_vocab_width < 0 or local_vocab_width > scaled_logits.shape[-1]:
+            raise ValueError(
+                f"invalid local vocab width {local_vocab_width} for logits "
+                f"width {scaled_logits.shape[-1]}"
+            )
+        scaled_logits = scaled_logits[..., :local_vocab_width]
+        embed_weight = embed_weight[:local_vocab_width]
+
+    logits_f = scaled_logits.float()
+    if global_max is None:
+        local_max = logits_f.max(dim=-1).values
+        global_max = (
+            all_reduce_max_fn(local_max) if all_reduce_max_fn is not None else local_max
+        )
+    else:
+        global_max = global_max.float()
+
+    local_exp = torch.exp(logits_f - global_max.unsqueeze(-1))
+    local_sum_exp = local_exp.sum(dim=-1)
+    weighted_logits = (local_exp * logits_f).sum(dim=-1)
+    soft_part = torch.matmul(local_exp.to(embed_weight.dtype), embed_weight).float()
+    packed = torch.cat(
+        [
+            local_sum_exp.unsqueeze(-1),
+            weighted_logits.unsqueeze(-1),
+            soft_part,
+        ],
+        dim=-1,
+    )
+    packed = all_reduce_sum_fn(packed) if all_reduce_sum_fn is not None else packed
+    global_sum_exp = packed[..., 0]
+    global_weighted_logits = packed[..., 1]
+
+    log_z = torch.log(global_sum_exp) + global_max
+    entropy = log_z - (global_weighted_logits / global_sum_exp)
+    global_soft_part = packed[..., 2:]
+    soft_embeds = (global_soft_part / global_sum_exp.unsqueeze(-1)).to(
+        embed_weight.dtype
+    )
+    return entropy, soft_embeds * normalizer
+
+
+def _local_vocab_argmax_tokens(
+    logits: torch.Tensor,
+    *,
+    vocab_start_index: int,
+    local_vocab_width: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return max values and global token ids for local-vocab logits."""
+    if local_vocab_width is not None:
+        local_vocab_width = int(local_vocab_width)
+        if local_vocab_width < 0 or local_vocab_width > logits.shape[-1]:
+            raise ValueError(
+                f"invalid local vocab width {local_vocab_width} for logits "
+                f"width {logits.shape[-1]}"
+            )
+        logits = logits[..., :local_vocab_width]
+
+    local_values, local_indices = logits.max(dim=-1)
+    global_indices = local_indices.to(torch.int64) + int(vocab_start_index)
+    return local_values, global_indices
+
+
+def _reduce_argmax_from_gathered_pairs(
+    local_values: torch.Tensor,
+    local_indices: torch.Tensor,
+    gathered_pairs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    gathered_values = gathered_pairs[..., 0]
+    gathered_indices = gathered_pairs[..., 1].to(torch.int64)
+    winning_values = gathered_values.max(dim=-1, keepdim=True).values
+    max_index = torch.iinfo(gathered_indices.dtype).max
+    tie_break_indices = torch.where(
+        gathered_values == winning_values,
+        gathered_indices,
+        torch.full_like(gathered_indices, max_index),
+    )
+    winning_rank = tie_break_indices.argmin(dim=-1, keepdim=True)
+    values = gathered_values.gather(dim=-1, index=winning_rank).squeeze(-1)
+    indices = gathered_indices.gather(dim=-1, index=winning_rank).squeeze(-1)
+    return values.to(local_values.dtype), indices.to(local_indices.dtype)
+
+
+def _merge_local_flashdenoise_state(
+    local_max: torch.Tensor,
+    local_sum_exp: torch.Tensor,
+    local_weighted_logits: torch.Tensor,
+    local_soft_part: torch.Tensor,
+    normalizer: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    global_max = _tp_all_reduce_max(local_max)
+    merge_scale = torch.exp(local_max - global_max)
+    packed = torch.cat(
+        [
+            (local_sum_exp * merge_scale).unsqueeze(-1),
+            (local_weighted_logits * merge_scale).unsqueeze(-1),
+            local_soft_part * merge_scale.unsqueeze(-1),
+        ],
+        dim=-1,
+    )
+    packed = _tp_all_reduce_sum(packed)
+    global_sum_exp = packed[..., 0]
+    global_weighted_logits = packed[..., 1]
+    entropy = (
+        torch.log(global_sum_exp) + global_max - global_weighted_logits / global_sum_exp
+    )
+    soft_embeds = packed[..., 2:] / global_sum_exp.unsqueeze(-1)
+    return entropy, soft_embeds * normalizer.float()
+
+
+def _tp_all_reduce_sum(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor_model_parallel_all_reduce(tensor)
+
+
+def _tp_all_reduce_max(tensor: torch.Tensor) -> torch.Tensor:
+    group = get_tp_group()
+    if group.world_size == 1:
+        return tensor
+    out = tensor.clone()
+    torch.distributed.all_reduce(
+        out, op=torch.distributed.ReduceOp.MAX, group=group.device_group
+    )
+    return out
+
+
+def _tp_all_ranks_true(value: bool, device: torch.device) -> bool:
+    group = get_tp_group()
+    if group.world_size == 1:
+        return bool(value)
+    if torch.device(device).type != "cuda":
+        return bool(value)
+    flag = torch.tensor(int(value), device=device, dtype=torch.int32)
+    torch.distributed.all_reduce(
+        flag, op=torch.distributed.ReduceOp.MIN, group=group.device_group
+    )
+    return bool(flag.item())
+
+
+def _tp_all_gather_vocab(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor_model_parallel_all_gather(tensor, dim=-1)
+
+
+def _tp_argmax_reduce_multi(
+    local_values: torch.Tensor,
+    global_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    group = get_tp_group()
+    if group.world_size == 1:
+        return local_values, global_indices
+    gathered_values = tensor_model_parallel_all_gather(
+        local_values.float(), dim=-1
+    ).view(*local_values.shape[:-1], group.world_size, local_values.shape[-1])
+    gathered_indices = tensor_model_parallel_all_gather(
+        global_indices.to(torch.int64), dim=-1
+    ).view(*global_indices.shape[:-1], group.world_size, global_indices.shape[-1])
+    gathered_values = gathered_values.transpose(-1, -2)
+    gathered_indices = gathered_indices.transpose(-1, -2)
+    gathered_pairs = torch.stack(
+        [gathered_values, gathered_indices.to(gathered_values.dtype)], dim=-1
+    )
+    return _reduce_argmax_from_gathered_pairs(
+        local_values, global_indices, gathered_pairs
+    )
+
+
+def _tp_rank_in_group() -> int:
+    return int(get_tp_group().rank_in_group)
+
+
+def _local_vocab_generator_seed(rank: int) -> int:
+    return 0xD1FF600D + int(rank)
+
+
+def _tp_broadcast_from_rank0(tensor: torch.Tensor) -> torch.Tensor:
+    group = get_tp_group()
+    if group.world_size == 1:
+        return tensor
+    return group.broadcast(tensor, src=0)
+
+
+def _should_use_local_vocab_sampler(
+    logits: torch.Tensor | None,
+    num_decode: int,
+    *,
+    vocab_size: int,
+) -> bool:
+    return (
+        _DIFFUSION_GEMMA_LOCAL_VOCAB_SAMPLER
+        and num_decode > 0
+        and logits is not None
+        and logits.shape[-1] != vocab_size
+    )
+
+
+def _is_sampler_warmup_batch(req_ids: Iterable[str]) -> bool:
+    req_ids = list(req_ids)
+    return bool(req_ids) and all(req_id.startswith("_warmup_") for req_id in req_ids)
+
+
+def _local_vocab_requires_full_logprobs(
+    max_num_logprobs: int,
+    *,
+    req_ids: Iterable[str] | None = None,
+) -> bool:
+    if max_num_logprobs < 0:
+        return False
+    return not (req_ids is not None and _is_sampler_warmup_batch(req_ids))
+
+
+def _local_vocab_logprobs_dense_fallback(
+    logits: torch.Tensor,
+    *,
+    num_decode: int,
+    canvas_length: int,
+    vocab_size: int,
+    all_gather_fn: Callable[[torch.Tensor], torch.Tensor] = _tp_all_gather_vocab,
+) -> torch.Tensor:
+    """Materialize dense logits only for logprobs requests."""
+    if logits.shape[-1] == vocab_size or num_decode == 0:
+        return logits
+    gathered = all_gather_fn(logits.reshape(num_decode, canvas_length, -1))
+    return gathered[..., :vocab_size].reshape(num_decode * canvas_length, vocab_size)
+
+
 @torch.compile(dynamic=True)
 def _compute_num_rejected(
     num_logits: torch.Tensor,
@@ -472,6 +793,7 @@ def _compiled_sample_step(
     decode_idx: torch.Tensor,  # [num_decode] int64 → position in num_reqs
     all_slots: torch.Tensor,  # [num_reqs] int64 → all slot indices
     valid_canvas_len: torch.Tensor,  # [num_decode] int64 → real canvas length (<=CL)
+    random_tokens: torch.Tensor,  # [num_decode, CL] synced across TP ranks
     # State tensors (modified in-place)
     canvas: torch.Tensor,  # [max_num_reqs, CL]
     argmax_canvas: torch.Tensor,  # [max_num_reqs, CL]
@@ -497,6 +819,7 @@ def _compiled_sample_step(
     ST: int,
     # Sampler config
     entropy_bound: float,
+    compute_soft_embed: bool,
 ) -> torch.Tensor:
     """Compiled decode step: temperature → Gumbel sample → probs/confidence →
     accept/renoise → convergence, all as vectorized PyTorch ops.
@@ -563,11 +886,6 @@ def _compiled_sample_step(
     )
     step_tensor[decode_slots] = new_step_val
 
-    # Random tokens for renoise / canvas reinit
-    random_tokens = torch.randint(
-        0, vocab_size, (num_decode, CL), device=device, dtype=canvas.dtype
-    )
-
     # Compute denoise canvas (accept/renoise)
     denoise_canvas = torch.where(eb_mask, new_tokens, random_tokens)
 
@@ -627,8 +945,11 @@ def _compiled_sample_step(
     # sc_embeds directly. Storing the [.., hidden] soft embed instead of the full
     # [.., vocab] probs avoids a giant persistent buffer.
     sc_keep = (is_denoise & ~is_encoder_phase[decode_slots])[:, None, None]
-    soft_embeds = torch.matmul(probs.to(embed_weight.dtype), embed_weight) * normalizer
-    sc_embeds[decode_slots] = soft_embeds * sc_keep
+    if compute_soft_embed:
+        soft_embeds = torch.matmul(probs.to(embed_weight.dtype), embed_weight)
+        sc_embeds[decode_slots] = soft_embeds * normalizer * sc_keep
+    else:
+        sc_embeds[decode_slots] = 0
 
     # Overwrite canvas with argmax for newly converged denoise requests
     newly_converged = (converged & is_denoise).unsqueeze(1)
@@ -726,6 +1047,9 @@ class DiffusionGemmaRequestStates:
             (n, self.canvas_length),
             dtype=torch.int64,
             device=self.device,
+        )
+        self.canvas[slot_indices_np] = _tp_broadcast_from_rank0(
+            self.canvas[slot_indices_np]
         )
 
     def add_request(self, slot_idx: int) -> None:
@@ -851,6 +1175,12 @@ class DiffusionGemmaModelState(ModelState):
             entropy_bound=entropy_bound,
             confidence_threshold=gen["confidence_threshold"],
             embed_weight=self.model.model.embed_tokens.weight,
+            embed_vocab_start_index=(
+                self.model.model.embed_tokens.shard_indices.org_vocab_start_index
+            ),
+            embed_vocab_end_index=(
+                self.model.model.embed_tokens.shard_indices.org_vocab_end_index
+            ),
             normalizer=self.model.model.normalizer,
         ), None
 
@@ -1053,6 +1383,8 @@ class DiffusionSampler:
         t_max: float,
         entropy_bound: float,
         embed_weight: torch.Tensor,
+        embed_vocab_start_index: int,
+        embed_vocab_end_index: int,
         normalizer: torch.Tensor,
     ):
         self.sampling_states = sampler.sampling_states
@@ -1060,7 +1392,10 @@ class DiffusionSampler:
         # Self-conditioning soft embed = probs @ embed_weight * normalizer,
         # computed in the sampler (see _compiled_sample_step).
         self.embed_weight = embed_weight
+        self.embed_vocab_start_index = embed_vocab_start_index
+        self.embed_vocab_end_index = embed_vocab_end_index
         self.normalizer = normalizer
+        self.normalizer_float = float(normalizer.detach().cpu().item())
         self.canvas_length = (
             diffusion_config.canvas_length if diffusion_config is not None else 32
         )
@@ -1093,6 +1428,15 @@ class DiffusionSampler:
         # Populated after the post-sample kernel detects convergence; consumed
         # on the subsequent commit step when num_sampled=CANVAS_LEN.
         self._pending_logprobs: dict[int, LogprobsTensors] = {}
+        self._local_vocab_generator: torch.Generator | None = None
+        self._native_flashdenoise_calls = 0
+
+    def _get_local_vocab_generator(self, device: torch.device) -> torch.Generator:
+        if self._local_vocab_generator is None:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(_local_vocab_generator_seed(_tp_rank_in_group()))
+            self._local_vocab_generator = generator
+        return self._local_vocab_generator
 
     def add_request(self, req_idx: int, prompt_len: int, sampling_params: Any) -> None:
         if use_penalty(sampling_params):
@@ -1107,6 +1451,540 @@ class DiffusionSampler:
 
     def apply_staged_writes(self) -> None:
         self.sampling_states.apply_staged_writes()
+
+    def _apply_denoise_step_outputs(
+        self,
+        decode_slots: torch.Tensor,
+        decode_idx: torch.Tensor,
+        all_slots: torch.Tensor,
+        valid_canvas_len: torch.Tensor,
+        is_committing: torch.Tensor,
+        new_tokens: torch.Tensor,
+        argmax_tokens: torch.Tensor,
+        token_entropy: torch.Tensor,
+        soft_embeds: torch.Tensor,
+        sampled: torch.Tensor,
+        num_sampled: torch.Tensor,
+    ) -> None:
+        states = self.diffusion_states
+        num_decode = decode_slots.shape[0]
+        device = decode_slots.device
+        CL = self.canvas_length
+        ST = states.stability_threshold
+
+        mean_entropy = token_entropy.mean(dim=-1)
+        states.confident[decode_slots] = mean_entropy < self.confidence_threshold
+
+        sorted_ent, sorted_idx = torch.sort(token_entropy, dim=-1)
+        cumsum_ent = torch.cumsum(sorted_ent, dim=-1)
+        cummax_ent = torch.cummax(sorted_ent, dim=-1).values
+        sorted_mask = (cumsum_ent - cummax_ent) <= self.entropy_bound
+        eb_mask = torch.zeros_like(sorted_mask)
+        eb_mask.scatter_(1, sorted_idx, sorted_mask)
+
+        is_commit = is_committing
+        is_denoise = ~is_commit
+        cur_step = states.step[decode_slots].float()
+        new_step_val = torch.where(
+            is_denoise,
+            (cur_step + 1).to(states.step.dtype),
+            states.step.new_zeros(num_decode),
+        )
+        states.step[decode_slots] = new_step_val
+
+        random_tokens = torch.randint(
+            0,
+            self.vocab_size,
+            (num_decode, CL),
+            device=device,
+            dtype=states.canvas.dtype,
+        )
+        random_tokens = _tp_broadcast_from_rank0(random_tokens)
+        denoise_canvas = torch.where(eb_mask, new_tokens, random_tokens)
+        states.canvas[decode_slots] = torch.where(
+            is_commit.unsqueeze(1), random_tokens, denoise_canvas
+        )
+
+        hist_len = states.accepted_canvas_history_len[decode_slots]
+        write_pos = hist_len % ST
+        for i in range(ST):
+            write_here = ((write_pos == i) & is_denoise).unsqueeze(1)
+            states.accepted_canvas_history[decode_slots, i] = torch.where(
+                write_here,
+                argmax_tokens,
+                states.accepted_canvas_history[decode_slots, i],
+            )
+
+        states.argmax_canvas[decode_slots] = torch.where(
+            is_denoise.unsqueeze(1), argmax_tokens, states.argmax_canvas[decode_slots]
+        )
+
+        new_hist_len = torch.where(
+            is_denoise, hist_len + 1, hist_len.new_zeros(num_decode)
+        )
+        states.accepted_canvas_history_len[decode_slots] = new_hist_len
+
+        sampled[decode_idx] = states.argmax_canvas[decode_slots].to(
+            sampled.dtype
+        ) * is_commit.unsqueeze(1).to(sampled.dtype)
+        num_sampled[decode_idx] = is_commit.to(num_sampled.dtype) * valid_canvas_len.to(
+            num_sampled.dtype
+        )
+
+        ref = states.accepted_canvas_history[decode_slots, 0]
+        mismatch = torch.zeros(num_decode, device=device, dtype=torch.int32)
+        for h in range(1, ST):
+            mismatch = (
+                mismatch
+                + (ref != states.accepted_canvas_history[decode_slots, h])
+                .sum(dim=-1)
+                .int()
+            )
+        stable = mismatch == 0
+
+        step_after = states.step[decode_slots]
+        converged = (stable & states.confident[decode_slots] & (new_hist_len >= ST)) | (
+            step_after >= states.max_denoising_steps
+        )
+        states.is_encoder_phase[decode_slots] = torch.where(
+            is_commit, is_commit.new_zeros(num_decode), converged
+        )
+
+        sc_keep = (is_denoise & ~states.is_encoder_phase[decode_slots])[:, None, None]
+        states.self_conditioning_embeds[decode_slots] = (soft_embeds * sc_keep).to(
+            states.self_conditioning_embeds.dtype
+        )
+
+        newly_converged = (converged & is_denoise).unsqueeze(1)
+        states.canvas[decode_slots] = torch.where(
+            newly_converged,
+            states.argmax_canvas[decode_slots],
+            states.canvas[decode_slots],
+        )
+
+        self.req_states.draft_tokens[all_slots, :CL] = states.canvas[all_slots]
+
+    def _sample_native_tp_state_from_hidden_states(
+        self,
+        model: Any,
+        hidden_states: torch.Tensor,
+        input_batch: Any,
+    ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor] | None:
+        device = hidden_states.device
+        native_local_state_op = getattr(
+            ops, "diffusion_gemma_flashdenoise_local_state_scaled", None
+        )
+        native_op_available = _tp_all_ranks_true(
+            native_local_state_op is not None
+            and hasattr(torch.ops, "_C")
+            and hasattr(
+                torch.ops._C, "diffusion_gemma_flashdenoise_local_state_scaled"
+            ),
+            device,
+        )
+        if not native_op_available:
+            logger.warning_once(
+                "VLLM_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE_TP_STATE=1 requires "
+                "diffusion_gemma_flashdenoise_local_state_scaled; falling back."
+            )
+            return None
+
+        lm_head_weight = getattr(getattr(model, "lm_head", None), "weight", None)
+        has_lm_head = isinstance(lm_head_weight, torch.Tensor)
+        if not _tp_all_ranks_true(has_lm_head, device) or not has_lm_head:
+            return None
+        local_vocab_width = self.embed_vocab_end_index - self.embed_vocab_start_index
+        local_vocab_ok = (
+            local_vocab_width > 0 and local_vocab_width <= lm_head_weight.shape[0]
+        )
+        if not _tp_all_ranks_true(local_vocab_ok, device) or not local_vocab_ok:
+            logger.warning_once(
+                "VLLM_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE_TP_STATE=1 "
+                "requires a non-empty supported TP-local vocab shard; "
+                "falling back."
+            )
+            return None
+        lm_head_weight = lm_head_weight[:local_vocab_width]
+        embed_weight = self.embed_weight[:local_vocab_width]
+        weights_tied = (
+            embed_weight.shape == lm_head_weight.shape
+            and embed_weight.data_ptr() == lm_head_weight.data_ptr()
+        )
+        if not _tp_all_ranks_true(weights_tied, device) or not weights_tied:
+            logger.warning_once(
+                "VLLM_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE_TP_STATE=1 requires "
+                "tied TP-local LM-head/embedding weights; falling back."
+            )
+            return None
+        tensor_layout_ok = (
+            hidden_states.dtype == torch.bfloat16
+            and lm_head_weight.dtype == torch.bfloat16
+            and hidden_states.is_cuda
+            and lm_head_weight.is_cuda
+            and lm_head_weight.is_contiguous()
+        )
+        if not _tp_all_ranks_true(tensor_layout_ok, device) or not tensor_layout_ok:
+            return None
+
+        num_reqs = input_batch.num_reqs
+        states = self.diffusion_states
+        CL = self.canvas_length
+        slots_np = input_batch.idx_mapping_np[:num_reqs]
+        per_req_nlogits_np = np.diff(input_batch.cu_num_logits_np[: num_reqs + 1])
+
+        decode_indices_np = np.where(per_req_nlogits_np > 0)[0]
+        prefill_indices_np = np.where(per_req_nlogits_np == 0)[0]
+        decode_slots_np = slots_np[decode_indices_np]
+        num_decode = len(decode_indices_np)
+        if num_decode == 0:
+            return None
+        max_num_logprobs = self.sampling_states.max_num_logprobs(slots_np)
+        if max_num_logprobs >= 0:
+            return None
+
+        self._decode_slots.np[:num_decode] = decode_slots_np
+        self._decode_idx.np[:num_decode] = decode_indices_np
+        self._decode_slots.copy_to_uva()
+        self._decode_idx.copy_to_uva()
+        decode_slots = self._decode_slots.gpu[:num_decode]
+        decode_idx = self._decode_idx.gpu[:num_decode]
+
+        valid_canvas_len_np = per_req_nlogits_np[per_req_nlogits_np > 0]
+        expected_hidden_rows = int(valid_canvas_len_np.sum())
+        hidden_rows_ok = hidden_states.shape[0] == expected_hidden_rows
+        if not _tp_all_ranks_true(hidden_rows_ok, device) or not hidden_rows_ok:
+            logger.warning_once(
+                "VLLM_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE_TP_STATE=1 expected "
+                "%d hidden rows for %d decode requests but got %d; falling back.",
+                expected_hidden_rows,
+                num_decode,
+                hidden_states.shape[0],
+            )
+            return None
+
+        rows = num_decode * CL
+        hidden_size = hidden_states.shape[-1]
+        mvp_shape_ok = (
+            rows <= 32768
+            and local_vocab_width <= 262144
+            and hidden_size <= 8192
+            and local_vocab_width % 8 == 0
+            and hidden_size % 8 == 0
+        )
+        if not _tp_all_ranks_true(mvp_shape_ok, device) or not mvp_shape_ok:
+            logger.warning_once(
+                "VLLM_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE_TP_STATE=1 "
+                "local-state MVP supports rows<=32768, local_vocab<=262144, "
+                "hidden<=8192, and 8-divisible local vocab/hidden; falling back."
+            )
+            return None
+
+        estimated_temp_bytes = (
+            (2 * rows * local_vocab_width)
+            + (local_vocab_width * hidden_size)
+            + (rows * hidden_size)
+        ) * torch.finfo(torch.float32).bits // 8
+        estimated_state_bytes = (
+            rows * 6 * torch.finfo(torch.float32).bits // 8
+            + rows * 2 * torch.iinfo(torch.int64).bits // 8
+        )
+        estimated_workspace_bytes = estimated_temp_bytes + estimated_state_bytes
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+        memory_ok = estimated_workspace_bytes < int(free_bytes * 0.80)
+        if not _tp_all_ranks_true(memory_ok, device) or not memory_ok:
+            logger.warning_once(
+                "VLLM_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE_TP_STATE=1 "
+                "estimated %.2f GiB temp workspace with %.2f GiB free; "
+                "falling back.",
+                estimated_workspace_bytes / (1024**3),
+                free_bytes / (1024**3),
+            )
+            return None
+
+        if len(prefill_indices_np) > 0:
+            self._finish_prefills(input_batch, prefill_indices_np)
+
+        valid_canvas_len = async_copy_to_gpu(
+            valid_canvas_len_np.astype(np.int64), device=device
+        )
+        if valid_canvas_len_np.min() < CL:
+            ar = torch.arange(CL, device=device)
+            starts = valid_canvas_len.cumsum(0) - valid_canvas_len
+            valid = ar.unsqueeze(0) < valid_canvas_len.unsqueeze(1)
+            src = (starts.unsqueeze(1) + ar.unsqueeze(0)).clamp_max(
+                hidden_states.shape[0] - 1
+            )
+            hidden_states = hidden_states[src.reshape(-1)] * valid.reshape(
+                -1, 1
+            ).to(hidden_states.dtype)
+
+        sampled = self._sampled[:num_reqs]
+        num_sampled = self._num_sampled[:num_reqs]
+        sampled.zero_()
+        num_sampled.zero_()
+        all_slots = input_batch.idx_mapping[:num_reqs]
+        is_committing = states.is_encoder_phase[decode_slots].clone()
+
+        hidden_2d = hidden_states.reshape(rows, -1).contiguous()
+        steps_f = states.step[decode_slots].float()
+        remaining = (states.max_denoising_steps - steps_f).clamp(min=1.0)
+        temp = self.t_min + (self.t_max - self.t_min) * (
+            remaining / states.max_denoising_steps
+        )
+        logit_scale = (
+            1.0 / temp[:, None].clamp(min=1e-10).expand(num_decode, CL)
+        ).reshape(rows).contiguous()
+
+        local_max = torch.empty(rows, device=device, dtype=torch.float32)
+        local_sum_exp = torch.empty(rows, device=device, dtype=torch.float32)
+        local_weighted_logits = torch.empty(rows, device=device, dtype=torch.float32)
+        local_soft_part = torch.empty(
+            rows, hidden_2d.shape[-1], device=device, dtype=torch.float32
+        )
+        clean_values = torch.empty(rows, device=device, dtype=torch.float32)
+        clean_indices = torch.empty(rows, device=device, dtype=torch.int64)
+        sample_values = torch.empty(rows, device=device, dtype=torch.float32)
+        sample_indices = torch.empty(rows, device=device, dtype=torch.int64)
+
+        logger.info_once(
+            "Using native DiffusionGemma FlashDenoise TP-state pre-logit path."
+        )
+        native_local_state_op(
+            local_max,
+            local_sum_exp,
+            local_weighted_logits,
+            local_soft_part,
+            clean_values,
+            clean_indices,
+            sample_values,
+            sample_indices,
+            hidden_2d,
+            lm_head_weight,
+            logit_scale,
+            vocab_start_index=self.embed_vocab_start_index,
+            final_logit_softcapping=float(
+                getattr(model, "final_logit_softcapping", 0.0) or 0.0
+            ),
+            rng_seed=_DIFFUSION_GEMMA_FLASHDENOISE_SEED,
+            rng_offset=self._native_flashdenoise_calls,
+        )
+        self._native_flashdenoise_calls += 1
+
+        token_entropy, soft_embeds = _merge_local_flashdenoise_state(
+            local_max,
+            local_sum_exp,
+            local_weighted_logits,
+            local_soft_part,
+            self.normalizer,
+        )
+        _, argmax_indices = _tp_argmax_reduce_multi(
+            torch.stack([sample_values, clean_values], dim=-1),
+            torch.stack([sample_indices, clean_indices], dim=-1),
+        )
+
+        self._apply_denoise_step_outputs(
+            decode_slots,
+            decode_idx,
+            all_slots,
+            valid_canvas_len,
+            is_committing,
+            argmax_indices[..., 0].reshape(num_decode, CL),
+            argmax_indices[..., 1].reshape(num_decode, CL),
+            token_entropy.reshape(num_decode, CL),
+            soft_embeds.reshape(num_decode, CL, -1),
+            sampled,
+            num_sampled,
+        )
+        sampler_output = self._build_output(
+            input_batch,
+            sampled,
+            num_sampled,
+            per_req_nlogits_np,
+            device,
+            logprobs_tensors=None,
+        )
+        return (
+            sampler_output,
+            sampler_output.num_sampled,
+            sampler_output.num_rejected,
+        )
+
+    def sample_from_hidden_states(
+        self,
+        model: Any,
+        hidden_states: torch.Tensor,
+        input_batch: Any,
+    ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor] | None:
+        if not (
+            _DIFFUSION_GEMMA_FLASHDENOISE_NATIVE
+            or _DIFFUSION_GEMMA_FLASHDENOISE_NATIVE_TP_STATE
+        ):
+            return None
+        if model is None or input_batch is None or input_batch.num_draft_tokens == 0:
+            return None
+
+        tp_world_size = get_tp_group().world_size
+        if _DIFFUSION_GEMMA_FLASHDENOISE_NATIVE_TP_STATE:
+            tp_output = self._sample_native_tp_state_from_hidden_states(
+                model, hidden_states, input_batch
+            )
+            if tp_output is not None:
+                return tp_output
+            if tp_world_size != 1 or not _DIFFUSION_GEMMA_FLASHDENOISE_NATIVE:
+                return None
+
+        if tp_world_size != 1:
+            logger.warning_once(
+                "VLLM_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE=1 requires TP=1; "
+                "falling back to the standard DiffusionGemma sampler."
+            )
+            return None
+
+        lm_head_weight = getattr(getattr(model, "lm_head", None), "weight", None)
+        if not isinstance(lm_head_weight, torch.Tensor):
+            return None
+        lm_head_weight = lm_head_weight[: self.vocab_size]
+        embed_weight = self.embed_weight[: self.vocab_size]
+        if (
+            embed_weight.shape != lm_head_weight.shape
+            or embed_weight.data_ptr() != lm_head_weight.data_ptr()
+        ):
+            logger.warning_once(
+                "VLLM_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE=1 requires tied "
+                "full-vocab LM-head/embedding weights; falling back to the "
+                "standard DiffusionGemma sampler."
+            )
+            return None
+        if (
+            hidden_states.dtype != torch.bfloat16
+            or lm_head_weight.dtype != torch.bfloat16
+            or not hidden_states.is_cuda
+            or not lm_head_weight.is_cuda
+            or not lm_head_weight.is_contiguous()
+        ):
+            return None
+
+        num_reqs = input_batch.num_reqs
+        device = hidden_states.device
+        states = self.diffusion_states
+        CL = self.canvas_length
+        slots_np = input_batch.idx_mapping_np[:num_reqs]
+        per_req_nlogits_np = np.diff(input_batch.cu_num_logits_np[: num_reqs + 1])
+
+        decode_indices_np = np.where(per_req_nlogits_np > 0)[0]
+        prefill_indices_np = np.where(per_req_nlogits_np == 0)[0]
+        decode_slots_np = slots_np[decode_indices_np]
+
+        num_decode = len(decode_indices_np)
+        if num_decode == 0:
+            return None
+        max_num_logprobs = self.sampling_states.max_num_logprobs(slots_np)
+        if max_num_logprobs >= 0:
+            return None
+
+        if len(prefill_indices_np) > 0:
+            self._finish_prefills(input_batch, prefill_indices_np)
+
+        self._decode_slots.np[:num_decode] = decode_slots_np
+        self._decode_idx.np[:num_decode] = decode_indices_np
+        self._decode_slots.copy_to_uva()
+        self._decode_idx.copy_to_uva()
+        decode_slots = self._decode_slots.gpu[:num_decode]
+        decode_idx = self._decode_idx.gpu[:num_decode]
+
+        valid_canvas_len_np = per_req_nlogits_np[per_req_nlogits_np > 0]
+        valid_canvas_len = async_copy_to_gpu(
+            valid_canvas_len_np.astype(np.int64), device=device
+        )
+        if valid_canvas_len_np.min() < CL:
+            ar = torch.arange(CL, device=device)
+            starts = valid_canvas_len.cumsum(0) - valid_canvas_len
+            valid = ar.unsqueeze(0) < valid_canvas_len.unsqueeze(1)
+            src = (starts.unsqueeze(1) + ar.unsqueeze(0)).clamp_max(
+                hidden_states.shape[0] - 1
+            )
+            hidden_states = hidden_states[src.reshape(-1)] * valid.reshape(
+                -1, 1
+            ).to(hidden_states.dtype)
+
+        sampled = self._sampled[:num_reqs]
+        num_sampled = self._num_sampled[:num_reqs]
+        sampled.zero_()
+        num_sampled.zero_()
+        all_slots = input_batch.idx_mapping[:num_reqs]
+        is_committing = states.is_encoder_phase[decode_slots].clone()
+
+        rows = num_decode * CL
+        hidden_2d = hidden_states.reshape(rows, -1).contiguous()
+        steps_f = states.step[decode_slots].float()
+        remaining = (states.max_denoising_steps - steps_f).clamp(min=1.0)
+        temp = self.t_min + (self.t_max - self.t_min) * (
+            remaining / states.max_denoising_steps
+        )
+        logit_scale = (
+            1.0 / temp[:, None].clamp(min=1e-10).expand(num_decode, CL)
+        ).reshape(rows).contiguous()
+
+        entropy = torch.empty(rows, device=device, dtype=torch.float32)
+        sample_values = torch.empty(rows, device=device, dtype=torch.float32)
+        sample_indices = torch.empty(rows, device=device, dtype=torch.int64)
+        clean_values = torch.empty(rows, device=device, dtype=torch.float32)
+        clean_indices = torch.empty(rows, device=device, dtype=torch.int64)
+        soft_embed = torch.empty(
+            rows, hidden_2d.shape[-1], device=device, dtype=torch.float32
+        )
+
+        logger.info_once(
+            "Using native DiffusionGemma FlashDenoise pre-logit path "
+            "(mode_flags=%d).",
+            _DIFFUSION_GEMMA_FLASHDENOISE_NATIVE_MODE_FLAGS,
+        )
+        ops.diffusion_gemma_flashdenoise_scaled(
+            entropy,
+            sample_values,
+            sample_indices,
+            clean_values,
+            clean_indices,
+            soft_embed,
+            hidden_2d,
+            lm_head_weight,
+            logit_scale,
+            self.normalizer_float,
+            final_logit_softcapping=float(
+                getattr(model, "final_logit_softcapping", 0.0) or 0.0
+            ),
+            mode_flags=_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE_MODE_FLAGS,
+            rng_seed=_DIFFUSION_GEMMA_FLASHDENOISE_SEED,
+            rng_offset=self._native_flashdenoise_calls,
+        )
+        self._native_flashdenoise_calls += 1
+
+        self._apply_denoise_step_outputs(
+            decode_slots,
+            decode_idx,
+            all_slots,
+            valid_canvas_len,
+            is_committing,
+            sample_indices.reshape(num_decode, CL),
+            clean_indices.reshape(num_decode, CL),
+            entropy.reshape(num_decode, CL),
+            soft_embed.reshape(num_decode, CL, -1),
+            sampled,
+            num_sampled,
+        )
+        sampler_output = self._build_output(
+            input_batch,
+            sampled,
+            num_sampled,
+            per_req_nlogits_np,
+            device,
+            logprobs_tensors=None,
+        )
+        return (
+            sampler_output,
+            sampler_output.num_sampled,
+            sampler_output.num_rejected,
+        )
 
     @property
     def penalties_state(self):
@@ -1201,6 +2079,164 @@ class DiffusionSampler:
             num_rejected=num_rejected,
         )
 
+    def _sample_local_vocab_step(
+        self,
+        logits: torch.Tensor,
+        decode_slots: torch.Tensor,
+        decode_idx: torch.Tensor,
+        all_slots: torch.Tensor,
+        valid_canvas_len: torch.Tensor,
+        is_committing: torch.Tensor,
+        sampled: torch.Tensor,
+        num_sampled: torch.Tensor,
+    ) -> torch.Tensor:
+        """Denoise step for vocab-sharded logits."""
+        states = self.diffusion_states
+        num_decode = decode_slots.shape[0]
+        device = decode_slots.device
+        CL = self.canvas_length
+        ST = states.stability_threshold
+
+        sampled.zero_()
+        num_sampled.zero_()
+
+        steps_f = states.step[decode_slots].float()
+        remaining = (states.max_denoising_steps - steps_f).clamp(min=1.0)
+        temp = self.t_min + (self.t_max - self.t_min) * (
+            remaining / states.max_denoising_steps
+        )
+
+        logits_3d = logits.reshape(num_decode, CL, -1).float()
+        scaled = logits_3d / temp[:, None, None].clamp(min=1e-10)
+        local_vocab_width = self.embed_vocab_end_index - self.embed_vocab_start_index
+
+        u = torch.rand(
+            scaled.shape,
+            device=device,
+            dtype=scaled.dtype,
+            generator=self._get_local_vocab_generator(device),
+        ).clamp(min=1e-20)
+        gumbel = -torch.log(-torch.log(u))
+        noisy = scaled + gumbel * (temp[:, None, None] > 0).float()
+        local_noisy_values, local_new_tokens = _local_vocab_argmax_tokens(
+            noisy,
+            vocab_start_index=self.embed_vocab_start_index,
+            local_vocab_width=local_vocab_width,
+        )
+        local_clean_values, local_argmax_tokens = _local_vocab_argmax_tokens(
+            scaled,
+            vocab_start_index=self.embed_vocab_start_index,
+            local_vocab_width=local_vocab_width,
+        )
+        argmax_values, argmax_indices = _tp_argmax_reduce_multi(
+            torch.stack([local_noisy_values, local_clean_values], dim=-1),
+            torch.stack([local_new_tokens, local_argmax_tokens], dim=-1),
+        )
+        new_tokens = argmax_indices[..., 0]
+        argmax_tokens = argmax_indices[..., 1]
+        global_clean_max = argmax_values[..., 1]
+
+        token_entropy, soft_embeds = _local_vocab_softmax_stats(
+            scaled,
+            self.embed_weight,
+            self.normalizer,
+            local_vocab_width=local_vocab_width,
+            global_max=global_clean_max,
+            all_reduce_sum_fn=_tp_all_reduce_sum,
+        )
+        mean_entropy = token_entropy.mean(dim=-1)
+        states.confident[decode_slots] = mean_entropy < self.confidence_threshold
+
+        sorted_ent, sorted_idx = torch.sort(token_entropy, dim=-1)
+        cumsum_ent = torch.cumsum(sorted_ent, dim=-1)
+        cummax_ent = torch.cummax(sorted_ent, dim=-1).values
+        sorted_mask = (cumsum_ent - cummax_ent) <= self.entropy_bound
+        eb_mask = torch.zeros_like(sorted_mask)
+        eb_mask.scatter_(1, sorted_idx, sorted_mask)
+
+        is_commit = is_committing
+        is_denoise = ~is_commit
+        cur_step = states.step[decode_slots].float()
+        new_step_val = torch.where(
+            is_denoise,
+            (cur_step + 1).to(states.step.dtype),
+            states.step.new_zeros(num_decode),
+        )
+        states.step[decode_slots] = new_step_val
+
+        random_tokens = torch.randint(
+            0,
+            self.vocab_size,
+            (num_decode, CL),
+            device=device,
+            dtype=states.canvas.dtype,
+        )
+        random_tokens = _tp_broadcast_from_rank0(random_tokens)
+        denoise_canvas = torch.where(eb_mask, new_tokens, random_tokens)
+        states.canvas[decode_slots] = torch.where(
+            is_commit.unsqueeze(1), random_tokens, denoise_canvas
+        )
+
+        hist_len = states.accepted_canvas_history_len[decode_slots]
+        write_pos = hist_len % ST
+        for i in range(ST):
+            write_here = ((write_pos == i) & is_denoise).unsqueeze(1)
+            states.accepted_canvas_history[decode_slots, i] = torch.where(
+                write_here,
+                argmax_tokens,
+                states.accepted_canvas_history[decode_slots, i],
+            )
+
+        states.argmax_canvas[decode_slots] = torch.where(
+            is_denoise.unsqueeze(1), argmax_tokens, states.argmax_canvas[decode_slots]
+        )
+
+        new_hist_len = torch.where(
+            is_denoise, hist_len + 1, hist_len.new_zeros(num_decode)
+        )
+        states.accepted_canvas_history_len[decode_slots] = new_hist_len
+
+        sampled[decode_idx] = states.argmax_canvas[decode_slots].to(
+            sampled.dtype
+        ) * is_commit.unsqueeze(1).to(sampled.dtype)
+        num_sampled[decode_idx] = is_commit.to(num_sampled.dtype) * valid_canvas_len.to(
+            num_sampled.dtype
+        )
+
+        ref = states.accepted_canvas_history[decode_slots, 0]
+        mismatch = torch.zeros(num_decode, device=device, dtype=torch.int32)
+        for h in range(1, ST):
+            mismatch = (
+                mismatch
+                + (ref != states.accepted_canvas_history[decode_slots, h])
+                .sum(dim=-1)
+                .int()
+            )
+        stable = mismatch == 0
+
+        step_after = states.step[decode_slots]
+        converged = (stable & states.confident[decode_slots] & (new_hist_len >= ST)) | (
+            step_after >= states.max_denoising_steps
+        )
+        states.is_encoder_phase[decode_slots] = torch.where(
+            is_commit, is_commit.new_zeros(num_decode), converged
+        )
+
+        sc_keep = (is_denoise & ~states.is_encoder_phase[decode_slots])[:, None, None]
+        states.self_conditioning_embeds[decode_slots] = (soft_embeds * sc_keep).to(
+            states.self_conditioning_embeds.dtype
+        )
+
+        newly_converged = (converged & is_denoise).unsqueeze(1)
+        states.canvas[decode_slots] = torch.where(
+            newly_converged,
+            states.argmax_canvas[decode_slots],
+            states.canvas[decode_slots],
+        )
+
+        self.req_states.draft_tokens[all_slots, :CL] = states.canvas[all_slots]
+        return scaled
+
     # ------------------------------------------------------------------
     # Main entry point
     # ------------------------------------------------------------------
@@ -1267,47 +2303,118 @@ class DiffusionSampler:
         # Snapshot which slots are committing BEFORE the compiled step runs,
         # since it mutates is_encoder_phase (commit→False, converge→True).
         is_committing = states.is_encoder_phase[decode_slots].clone()
+        max_num_logprobs = self.sampling_states.max_num_logprobs(slots_np)
+        use_local_vocab = _should_use_local_vocab_sampler(
+            logits, num_decode, vocab_size=self.vocab_size
+        )
+        if use_local_vocab and _local_vocab_requires_full_logprobs(
+            max_num_logprobs, req_ids=getattr(input_batch, "req_ids", [])[:num_reqs]
+        ):
+            logits = _local_vocab_logprobs_dense_fallback(
+                logits,
+                num_decode=num_decode,
+                canvas_length=CL,
+                vocab_size=self.vocab_size,
+            )
+            use_local_vocab = False
+            logger.warning_once(
+                "VLLM_DIFFUSION_GEMMA_LOCAL_VOCAB_SAMPLER=1 falling back to "
+                "dense logits for full-vocab logprobs."
+            )
+        compute_soft_embed_in_kernel = (
+            self.embed_vocab_start_index == 0
+            and self.embed_vocab_end_index == self.vocab_size
+            and self.embed_weight.shape[0] == self.vocab_size
+        )
 
         # --- Single compiled call: temp → sample → probs → post-process ---
-        scaled = _compiled_sample_step(
-            logits,
-            decode_slots,
-            decode_idx,
-            all_slots,
-            valid_canvas_len,
-            # State
-            states.canvas,
-            states.argmax_canvas,
-            states.step,
-            states.is_encoder_phase,
-            states.confident,
-            states.self_conditioning_embeds,
-            self.embed_weight,
-            self.normalizer,
-            states.accepted_canvas_history,
-            states.accepted_canvas_history_len,
-            # Output
-            sampled,
-            num_sampled,
-            self.req_states.draft_tokens,
-            # Config
-            max_denoising_steps=float(states.max_denoising_steps),
-            t_min=self.t_min,
-            t_max=self.t_max,
-            confidence_threshold=self.confidence_threshold,
-            vocab_size=self.vocab_size,
-            CL=self.canvas_length,
-            ST=states.stability_threshold,
-            entropy_bound=self.entropy_bound,
-        )
+        if use_local_vocab:
+            scaled = self._sample_local_vocab_step(
+                logits,
+                decode_slots,
+                decode_idx,
+                all_slots,
+                valid_canvas_len,
+                is_committing,
+                sampled,
+                num_sampled,
+            )
+        else:
+            random_tokens = torch.randint(
+                0,
+                self.vocab_size,
+                (num_decode, CL),
+                device=device,
+                dtype=states.canvas.dtype,
+            )
+            random_tokens = _tp_broadcast_from_rank0(random_tokens)
+            scaled = _compiled_sample_step(
+                logits,
+                decode_slots,
+                decode_idx,
+                all_slots,
+                valid_canvas_len,
+                random_tokens,
+                # State
+                states.canvas,
+                states.argmax_canvas,
+                states.step,
+                states.is_encoder_phase,
+                states.confident,
+                states.self_conditioning_embeds,
+                self.embed_weight,
+                self.normalizer,
+                states.accepted_canvas_history,
+                states.accepted_canvas_history_len,
+                # Output
+                sampled,
+                num_sampled,
+                self.req_states.draft_tokens,
+                # Config
+                max_denoising_steps=float(states.max_denoising_steps),
+                t_min=self.t_min,
+                t_max=self.t_max,
+                confidence_threshold=self.confidence_threshold,
+                vocab_size=self.vocab_size,
+                CL=self.canvas_length,
+                ST=states.stability_threshold,
+                entropy_bound=self.entropy_bound,
+                compute_soft_embed=compute_soft_embed_in_kernel,
+            )
+            if get_tp_group().world_size != 1:
+                # Dense TP fallback can use rank-local RNG for Gumbel sampling
+                # inside the compiled step. Keep the next model input identical.
+                states.canvas[decode_slots] = _tp_broadcast_from_rank0(
+                    states.canvas[decode_slots]
+                )
+                self.req_states.draft_tokens[all_slots, :CL] = states.canvas[
+                    all_slots
+                ]
+
+        if num_decode > 0 and not use_local_vocab and not compute_soft_embed_in_kernel:
+            log_probs = scaled.log_softmax(dim=-1)
+            probs = log_probs.exp()
+            soft_embeds = _vocab_parallel_soft_embed(
+                probs,
+                self.embed_weight,
+                self.normalizer,
+                vocab_start_index=self.embed_vocab_start_index,
+                vocab_end_index=self.embed_vocab_end_index,
+                all_reduce_fn=tensor_model_parallel_all_reduce,
+            )
+            sc_keep = (~is_committing & ~states.is_encoder_phase[decode_slots])[
+                :, None, None
+            ]
+            states.self_conditioning_embeds[decode_slots] = (soft_embeds * sc_keep).to(
+                states.self_conditioning_embeds.dtype
+            )
 
         # --- Logprobs: stash on convergence, return on commit ---
         slots_np = input_batch.idx_mapping_np[:num_reqs]
         is_decode_np = per_req_nlogits_np > 0
 
         logprobs_tensors = None
-        max_num_logprobs = self.sampling_states.max_num_logprobs(slots_np)
-        if max_num_logprobs >= 0:
+        if max_num_logprobs >= 0 and not use_local_vocab:
             # Denoise steps that just converged: the compiled step flipped
             # is_encoder_phase from False→True. Detect as slots where
             # is_encoder_phase is now True but is_committing was False.
