@@ -266,3 +266,55 @@ def test_local_state_soft_part_uses_bf16_tensor_core_semantics():
         atol=1e-3,
         rtol=2e-4,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_pack_local_state_matches_torch_merge_scale():
+    assert hasattr(
+        ops, "diffusion_gemma_flashdenoise_pack_local_state"
+    ), "native merge-pack wrapper is unavailable"
+
+    rows, hidden_size = 6, 17
+    generator = torch.Generator(device="cuda").manual_seed(20260623)
+    local_max = torch.randn(rows, device="cuda", generator=generator)
+    global_max = local_max + torch.rand(
+        rows, device="cuda", generator=generator
+    )
+    local_sum_exp = (
+        torch.rand(rows, device="cuda", generator=generator) * 3.0 + 0.1
+    )
+    local_weighted_logits = torch.randn(
+        rows, device="cuda", generator=generator
+    )
+    local_soft_part = torch.randn(
+        rows, hidden_size, device="cuda", generator=generator
+    )
+    packed = torch.empty(
+        rows, hidden_size + 2, device="cuda", dtype=torch.float32
+    )
+
+    ops.diffusion_gemma_flashdenoise_pack_local_state(
+        packed,
+        local_max,
+        global_max,
+        local_sum_exp,
+        local_weighted_logits,
+        local_soft_part,
+    )
+    torch.cuda.synchronize()
+
+    scale = torch.exp(local_max - global_max)
+    expected = torch.cat(
+        [
+            (local_sum_exp * scale).unsqueeze(-1),
+            (local_weighted_logits * scale).unsqueeze(-1),
+            local_soft_part * scale.unsqueeze(-1),
+        ],
+        dim=-1,
+    )
+    torch.testing.assert_close(
+        packed.cpu(),
+        expected.cpu(),
+        atol=1e-6,
+        rtol=1e-6,
+    )

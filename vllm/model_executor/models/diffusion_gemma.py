@@ -639,15 +639,34 @@ def _merge_local_flashdenoise_state(
     normalizer: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     global_max = _tp_all_reduce_max(local_max)
-    merge_scale = torch.exp(local_max - global_max)
-    packed = torch.cat(
-        [
-            (local_sum_exp * merge_scale).unsqueeze(-1),
-            (local_weighted_logits * merge_scale).unsqueeze(-1),
-            local_soft_part * merge_scale.unsqueeze(-1),
-        ],
-        dim=-1,
+    has_pack_op = hasattr(torch.ops, "_C") and hasattr(
+        torch.ops._C, "diffusion_gemma_flashdenoise_pack_local_state"
     )
+    if has_pack_op:
+        packed = torch.empty(
+            local_soft_part.shape[0],
+            local_soft_part.shape[1] + 2,
+            device=local_soft_part.device,
+            dtype=torch.float32,
+        )
+        ops.diffusion_gemma_flashdenoise_pack_local_state(
+            packed,
+            local_max,
+            global_max,
+            local_sum_exp,
+            local_weighted_logits,
+            local_soft_part,
+        )
+    else:
+        merge_scale = torch.exp(local_max - global_max)
+        packed = torch.cat(
+            [
+                (local_sum_exp * merge_scale).unsqueeze(-1),
+                (local_weighted_logits * merge_scale).unsqueeze(-1),
+                local_soft_part * merge_scale.unsqueeze(-1),
+            ],
+            dim=-1,
+        )
     packed = _tp_all_reduce_sum(packed)
     global_sum_exp = packed[..., 0]
     global_weighted_logits = packed[..., 1]

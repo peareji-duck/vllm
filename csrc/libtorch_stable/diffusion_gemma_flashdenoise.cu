@@ -335,6 +335,40 @@ __global__ void logits_to_local_state_exp_warp_kernel(
   }
 }
 
+__global__ void pack_local_state_kernel(
+    float* __restrict__ packed, const float* __restrict__ local_max,
+    const float* __restrict__ global_max,
+    const float* __restrict__ local_sum_exp,
+    const float* __restrict__ local_weighted_logits,
+    const float* __restrict__ local_soft_part, int rows, int hidden_size) {
+  const int row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+
+  __shared__ float merge_scale;
+  if (threadIdx.x == 0) {
+    merge_scale = expf(local_max[row] - global_max[row]);
+  }
+  __syncthreads();
+
+  const int columns = hidden_size + 2;
+  float* row_packed = packed + static_cast<int64_t>(row) * columns;
+  const float* row_soft =
+      local_soft_part + static_cast<int64_t>(row) * hidden_size;
+  for (int col = threadIdx.x; col < columns; col += blockDim.x) {
+    float value;
+    if (col == 0) {
+      value = local_sum_exp[row];
+    } else if (col == 1) {
+      value = local_weighted_logits[row];
+    } else {
+      value = row_soft[col - 2];
+    }
+    row_packed[col] = value * merge_scale;
+  }
+}
+
 void validate_flashdenoise_tensors(
     const char* label, torch::stable::Tensor& entropy,
     torch::stable::Tensor& sample_values,
@@ -562,6 +596,67 @@ void validate_local_state_tensors(
                   label, ": all tensors must be on the same CUDA device");
 }
 
+void validate_pack_local_state_tensors(
+    const char* label, torch::stable::Tensor& packed,
+    torch::stable::Tensor const& local_max,
+    torch::stable::Tensor const& global_max,
+    torch::stable::Tensor const& local_sum_exp,
+    torch::stable::Tensor const& local_weighted_logits,
+    torch::stable::Tensor const& local_soft_part) {
+  STD_TORCH_CHECK(packed.dim() == 2 && local_soft_part.dim() == 2,
+                  label, ": packed and local_soft_part must be rank-2");
+  STD_TORCH_CHECK(local_max.dim() == 1 && global_max.dim() == 1 &&
+                      local_sum_exp.dim() == 1 &&
+                      local_weighted_logits.dim() == 1,
+                  label, ": scalar state tensors must be rank-1");
+  STD_TORCH_CHECK(packed.is_cuda() && local_max.is_cuda() &&
+                      global_max.is_cuda() && local_sum_exp.is_cuda() &&
+                      local_weighted_logits.is_cuda() &&
+                      local_soft_part.is_cuda(),
+                  label, ": all tensors must be CUDA tensors");
+  STD_TORCH_CHECK(packed.is_contiguous() && local_max.is_contiguous() &&
+                      global_max.is_contiguous() &&
+                      local_sum_exp.is_contiguous() &&
+                      local_weighted_logits.is_contiguous() &&
+                      local_soft_part.is_contiguous(),
+                  label, ": all tensors must be contiguous");
+
+  const int64_t rows = local_soft_part.size(0);
+  const int64_t hidden_size = local_soft_part.size(1);
+  STD_TORCH_CHECK(local_max.size(0) == rows && global_max.size(0) == rows &&
+                      local_sum_exp.size(0) == rows &&
+                      local_weighted_logits.size(0) == rows &&
+                      packed.size(0) == rows &&
+                      packed.size(1) == hidden_size + 2,
+                  label, ": packed must be [rows, hidden+2] and scalar "
+                         "state tensors must be [rows]");
+  STD_TORCH_CHECK(hidden_size >= 0 &&
+                      rows <= std::numeric_limits<int>::max() &&
+                      hidden_size <= std::numeric_limits<int>::max() - 2,
+                  label, ": shapes exceed CUDA kernel limits");
+
+  STD_TORCH_CHECK(packed.scalar_type() == torch::headeronly::ScalarType::Float &&
+                      local_max.scalar_type() ==
+                          torch::headeronly::ScalarType::Float &&
+                      global_max.scalar_type() ==
+                          torch::headeronly::ScalarType::Float &&
+                      local_sum_exp.scalar_type() ==
+                          torch::headeronly::ScalarType::Float &&
+                      local_weighted_logits.scalar_type() ==
+                          torch::headeronly::ScalarType::Float &&
+                      local_soft_part.scalar_type() ==
+                          torch::headeronly::ScalarType::Float,
+                  label, ": all tensors must be fp32");
+
+  const int32_t device_index = local_soft_part.get_device_index();
+  STD_TORCH_CHECK(packed.get_device_index() == device_index &&
+                      local_max.get_device_index() == device_index &&
+                      global_max.get_device_index() == device_index &&
+                      local_sum_exp.get_device_index() == device_index &&
+                      local_weighted_logits.get_device_index() == device_index,
+                  label, ": all tensors must be on the same CUDA device");
+}
+
 void run_mode16(
     torch::stable::Tensor& entropy, torch::stable::Tensor& sample_values,
     torch::stable::Tensor& sample_indices, torch::stable::Tensor& clean_values,
@@ -732,6 +827,35 @@ void run_local_state_scaled(
       "local-state soft-part GEMM");
 }
 
+void run_pack_local_state(torch::stable::Tensor& packed,
+                          torch::stable::Tensor const& local_max,
+                          torch::stable::Tensor const& global_max,
+                          torch::stable::Tensor const& local_sum_exp,
+                          torch::stable::Tensor const& local_weighted_logits,
+                          torch::stable::Tensor const& local_soft_part) {
+  const int64_t rows = local_soft_part.size(0);
+  if (rows == 0) {
+    return;
+  }
+
+  const int64_t hidden_size = local_soft_part.size(1);
+  const int32_t device_index = local_soft_part.get_device_index();
+  const torch::stable::accelerator::DeviceGuard device_guard(device_index);
+  const cudaStream_t stream = get_current_cuda_stream(device_index);
+
+  pack_local_state_kernel<<<static_cast<unsigned int>(rows), 256, 0, stream>>>(
+      packed.mutable_data_ptr<float>(), local_max.const_data_ptr<float>(),
+      global_max.const_data_ptr<float>(), local_sum_exp.const_data_ptr<float>(),
+      local_weighted_logits.const_data_ptr<float>(),
+      local_soft_part.const_data_ptr<float>(), static_cast<int>(rows),
+      static_cast<int>(hidden_size));
+  const cudaError_t status = cudaGetLastError();
+  STD_TORCH_CHECK(status == cudaSuccess,
+                  "diffusion_gemma_flashdenoise_pack_local_state: kernel "
+                  "launch failed: " +
+                      std::string(cudaGetErrorString(status)));
+}
+
 }  // namespace
 
 void diffusion_gemma_flashdenoise(
@@ -800,4 +924,17 @@ void diffusion_gemma_flashdenoise_local_state_scaled(
                          logit_scale, vocab_start_index,
                          static_cast<float>(final_logit_softcapping), rng_seed,
                          rng_offset);
+}
+
+void diffusion_gemma_flashdenoise_pack_local_state(
+    torch::stable::Tensor& packed, torch::stable::Tensor const& local_max,
+    torch::stable::Tensor const& global_max,
+    torch::stable::Tensor const& local_sum_exp,
+    torch::stable::Tensor const& local_weighted_logits,
+    torch::stable::Tensor const& local_soft_part) {
+  validate_pack_local_state_tensors(
+      "diffusion_gemma_flashdenoise_pack_local_state", packed, local_max,
+      global_max, local_sum_exp, local_weighted_logits, local_soft_part);
+  run_pack_local_state(packed, local_max, global_max, local_sum_exp,
+                       local_weighted_logits, local_soft_part);
 }

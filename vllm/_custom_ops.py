@@ -2498,6 +2498,31 @@ def diffusion_gemma_flashdenoise_local_state_scaled(
     )
 
 
+def diffusion_gemma_flashdenoise_pack_local_state(
+    packed: torch.Tensor,
+    local_max: torch.Tensor,
+    global_max: torch.Tensor,
+    local_sum_exp: torch.Tensor,
+    local_weighted_logits: torch.Tensor,
+    local_soft_part: torch.Tensor,
+) -> None:
+    if not (
+        hasattr(torch.ops, "_C")
+        and hasattr(torch.ops._C, "diffusion_gemma_flashdenoise_pack_local_state")
+    ):
+        raise RuntimeError(
+            "diffusion_gemma_flashdenoise_pack_local_state native op is unavailable"
+        )
+    torch.ops._C.diffusion_gemma_flashdenoise_pack_local_state(
+        packed,
+        local_max,
+        global_max,
+        local_sum_exp,
+        local_weighted_logits,
+        local_soft_part,
+    )
+
+
 if hasattr(torch.ops, "_C") and hasattr(
     torch.ops._C, "diffusion_gemma_flashdenoise"
 ):
@@ -2566,6 +2591,22 @@ if hasattr(torch.ops, "_C") and hasattr(
         final_logit_softcapping: float,
         rng_seed: int,
         rng_offset: int,
+    ) -> None:
+        return
+
+
+if hasattr(torch.ops, "_C") and hasattr(
+    torch.ops._C, "diffusion_gemma_flashdenoise_pack_local_state"
+):
+
+    @register_fake("_C::diffusion_gemma_flashdenoise_pack_local_state")
+    def diffusion_gemma_flashdenoise_pack_local_state_fake(
+        packed: torch.Tensor,
+        local_max: torch.Tensor,
+        global_max: torch.Tensor,
+        local_sum_exp: torch.Tensor,
+        local_weighted_logits: torch.Tensor,
+        local_soft_part: torch.Tensor,
     ) -> None:
         return
 

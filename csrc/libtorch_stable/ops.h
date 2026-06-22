@@ -59,6 +59,13 @@ void diffusion_gemma_flashdenoise_local_state_scaled(
     torch::stable::Tensor const& lm_head_weight,
     torch::stable::Tensor const& logit_scale, int64_t vocab_start_index,
     double final_logit_softcapping, int64_t rng_seed, int64_t rng_offset);
+
+void diffusion_gemma_flashdenoise_pack_local_state(
+    torch::stable::Tensor& packed, torch::stable::Tensor const& local_max,
+    torch::stable::Tensor const& global_max,
+    torch::stable::Tensor const& local_sum_exp,
+    torch::stable::Tensor const& local_weighted_logits,
+    torch::stable::Tensor const& local_soft_part);
 #endif
 
 torch::stable::Tensor permute_cols(torch::stable::Tensor const& A,
