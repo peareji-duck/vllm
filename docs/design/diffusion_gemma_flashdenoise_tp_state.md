@@ -84,3 +84,32 @@ The CPU reference tests in
 TP state against dense softmax, dense entropy, dense soft embedding, clean
 argmax, and Gumbel argmax for TP=4, non-divisible shard ranges with padding,
 and deterministic global-id tie breaking.
+
+## H100 TP4 BF16 Soft-Part Result
+
+The native TP-state path computes the local soft embedding numerator with BF16
+inputs and FP32 accumulation, matching `torch.mm(..., out_dtype=torch.float32)`
+semantics while avoiding a per-call BF16-to-FP32 LM-head conversion. A TP4 H100
+serving benchmark used:
+
+```text
+input_len=128
+output_len=4
+num_prompts=64
+max_num_seqs=16
+max_model_len=1024
+request_rate=inf
+repeats=3
+```
+
+Median request throughput:
+
+| Max concurrency | local_vocab_pytorch | native_tp_state | Delta |
+| ---: | ---: | ---: | ---: |
+| 4 | 1.7558 req/s | 1.7553 req/s | -0.02% |
+| 8 | 2.9978 req/s | 2.9996 req/s | +0.06% |
+| 16 | 3.6298 req/s | 4.0263 req/s | +10.92% |
+| 32 | 3.6438 req/s | 4.0369 req/s | +10.79% |
+
+All native runs logged the TP-state path marker, and there were no failed
+benchmark repeats.
