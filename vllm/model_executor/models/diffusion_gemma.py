@@ -1680,10 +1680,10 @@ class DiffusionSampler:
             return None
 
         estimated_temp_bytes = (
-            (2 * rows * local_vocab_width)
-            + (local_vocab_width * hidden_size)
-            + (rows * hidden_size)
-        ) * torch.finfo(torch.float32).bits // 8
+            rows * local_vocab_width * torch.finfo(torch.float32).bits // 8
+            + rows * local_vocab_width * torch.finfo(torch.bfloat16).bits // 8
+            + rows * hidden_size * torch.finfo(torch.float32).bits // 8
+        )
         estimated_state_bytes = (
             rows * 6 * torch.finfo(torch.float32).bits // 8
             + rows * 2 * torch.iinfo(torch.int64).bits // 8

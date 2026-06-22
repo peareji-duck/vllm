@@ -69,7 +69,9 @@ def _dense_local_state_reference(
     local_exp = torch.exp(logits - local_max.unsqueeze(-1))
     local_sum_exp = local_exp.sum(dim=-1)
     local_weighted_logits = (local_exp * logits).sum(dim=-1)
-    local_soft_part = torch.matmul(local_exp, lm_head_weight.float())
+    local_soft_part = torch.mm(
+        local_exp.to(torch.bfloat16), lm_head_weight, out_dtype=torch.float32
+    )
     clean_indices = local_indices.to(torch.int64) + vocab_start_index
     gumbels = _deterministic_gumbels(
         hidden.shape[0],
@@ -187,3 +189,80 @@ def test_local_state_scaled_matches_dense_reference_for_local_vocab_shard(
         sample_values.cpu(), expected[5].cpu(), atol=3e-3, rtol=0
     )
     torch.testing.assert_close(sample_indices.cpu(), expected[6].cpu())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_local_state_soft_part_uses_bf16_tensor_core_semantics():
+    if not hasattr(torch.ops, "_C") or not hasattr(
+        torch.ops._C, "diffusion_gemma_flashdenoise_local_state_scaled"
+    ):
+        pytest.skip("native FlashDenoise TP-state op is unavailable")
+
+    rows, hidden_size, local_vocab = 5, 64, 128
+    vocab_start_index = 4096
+    generator = torch.Generator(device="cuda").manual_seed(20260622)
+    hidden = (
+        torch.randn(
+            rows,
+            hidden_size,
+            device="cuda",
+            dtype=torch.float32,
+            generator=generator,
+        )
+        * 0.45
+    ).to(torch.bfloat16)
+    lm_head_weight = (
+        torch.randn(
+            local_vocab,
+            hidden_size,
+            device="cuda",
+            dtype=torch.float32,
+            generator=generator,
+        )
+        * 0.7
+    ).to(torch.bfloat16)
+    logit_scale = torch.linspace(0.7, 1.9, rows, device="cuda", dtype=torch.float32)
+
+    local_max = torch.empty(rows, device="cuda", dtype=torch.float32)
+    local_sum_exp = torch.empty(rows, device="cuda", dtype=torch.float32)
+    local_weighted_logits = torch.empty(rows, device="cuda", dtype=torch.float32)
+    local_soft_part = torch.empty(
+        rows, hidden_size, device="cuda", dtype=torch.float32
+    )
+    clean_values = torch.empty(rows, device="cuda", dtype=torch.float32)
+    clean_indices = torch.empty(rows, device="cuda", dtype=torch.int64)
+    sample_values = torch.empty(rows, device="cuda", dtype=torch.float32)
+    sample_indices = torch.empty(rows, device="cuda", dtype=torch.int64)
+
+    ops.diffusion_gemma_flashdenoise_local_state_scaled(
+        local_max,
+        local_sum_exp,
+        local_weighted_logits,
+        local_soft_part,
+        clean_values,
+        clean_indices,
+        sample_values,
+        sample_indices,
+        hidden,
+        lm_head_weight,
+        logit_scale,
+        vocab_start_index,
+        0.0,
+        rng_seed=1234,
+        rng_offset=99,
+    )
+    torch.cuda.synchronize()
+
+    logits = torch.mm(hidden, lm_head_weight.t(), out_dtype=torch.float32)
+    logits = logits * logit_scale.unsqueeze(-1)
+    exp_weights = torch.exp(logits - logits.max(dim=-1).values.unsqueeze(-1))
+    expected_soft_part = torch.mm(
+        exp_weights.to(torch.bfloat16), lm_head_weight, out_dtype=torch.float32
+    )
+
+    torch.testing.assert_close(
+        local_soft_part.cpu(),
+        expected_soft_part.cpu(),
+        atol=1e-3,
+        rtol=2e-4,
+    )

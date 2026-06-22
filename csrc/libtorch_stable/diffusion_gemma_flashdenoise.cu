@@ -210,7 +210,7 @@ __global__ void logits_to_stats_probs_warp_kernel(
 }
 
 __global__ void logits_to_local_state_exp_warp_kernel(
-    const float* __restrict__ logits, float* __restrict__ exp_weights,
+    const float* __restrict__ logits, __nv_bfloat16* __restrict__ exp_weights,
     const float* __restrict__ logit_scale, bool logit_scale_is_scalar,
     float final_logit_softcapping, float* __restrict__ local_max,
     float* __restrict__ local_sum_exp,
@@ -234,7 +234,8 @@ __global__ void logits_to_local_state_exp_warp_kernel(
   __shared__ float shared_weighted[32];
 
   const float* row_logits = logits + static_cast<int64_t>(row) * vocab_size;
-  float* row_exp = exp_weights + static_cast<int64_t>(row) * vocab_size;
+  __nv_bfloat16* row_exp =
+      exp_weights + static_cast<int64_t>(row) * vocab_size;
   const float row_scale = logit_scale_is_scalar ? logit_scale[0]
                                                 : logit_scale[row];
 
@@ -279,7 +280,7 @@ __global__ void logits_to_local_state_exp_warp_kernel(
         apply_final_logit_softcap(row_logits[v], final_logit_softcapping) *
         row_scale;
     const float exp_value = expf(value - max_logit);
-    row_exp[v] = exp_value;
+    row_exp[v] = __float2bfloat16(exp_value);
     row_sum_exp += exp_value;
     row_weighted_logits += exp_value * value;
 
@@ -331,16 +332,6 @@ __global__ void logits_to_local_state_exp_warp_kernel(
         vocab_start_index + static_cast<int64_t>(shared_indices[0]);
     clean_values[row] = max_logit;
     clean_indices[row] = vocab_start_index + static_cast<int64_t>(max_idx);
-  }
-}
-
-__global__ void bf16_to_float_kernel(const __nv_bfloat16* __restrict__ input,
-                                     float* __restrict__ output,
-                                     int64_t numel) {
-  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-  for (; idx < numel; idx += stride) {
-    output[idx] = __bfloat162float(input[idx]);
   }
 }
 
@@ -682,16 +673,13 @@ void run_local_state_scaled(
   auto logits = torch::stable::empty({rows, vocab_size},
                                      torch::headeronly::ScalarType::Float,
                                      std::nullopt, device);
-  auto exp_weights = torch::stable::empty({rows, vocab_size},
-                                          torch::headeronly::ScalarType::Float,
-                                          std::nullopt, device);
-  auto weight_float = torch::stable::empty({vocab_size, hidden_size},
-                                           torch::headeronly::ScalarType::Float,
-                                           std::nullopt, device);
+  auto exp_weights = torch::stable::empty(
+      {rows, vocab_size}, torch::headeronly::ScalarType::BFloat16, std::nullopt,
+      device);
 
   auto* logits_ptr = logits.mutable_data_ptr<float>();
-  auto* exp_weights_ptr = exp_weights.mutable_data_ptr<float>();
-  auto* weight_float_ptr = weight_float.mutable_data_ptr<float>();
+  auto* exp_weights_ptr =
+      reinterpret_cast<__nv_bfloat16*>(exp_weights.mutable_data_ptr());
   const auto* hidden_ptr =
       reinterpret_cast<const __nv_bfloat16*>(hidden.const_data_ptr());
   const auto* weight_ptr =
@@ -733,28 +721,14 @@ void run_local_state_scaled(
                   "logits-to-local-state kernel launch failed: " +
                       std::string(cudaGetErrorString(status)));
 
-  constexpr int kConvertThreads = 256;
-  int convert_blocks =
-      static_cast<int>((vocab_size * hidden_size + kConvertThreads - 1) /
-                       kConvertThreads);
-  if (convert_blocks > 65535) {
-    convert_blocks = 65535;
-  }
-  bf16_to_float_kernel<<<convert_blocks, kConvertThreads, 0, stream>>>(
-      weight_ptr, weight_float_ptr, vocab_size * hidden_size);
-  status = cudaGetLastError();
-  STD_TORCH_CHECK(status == cudaSuccess,
-                  "diffusion_gemma_flashdenoise_local_state_scaled: "
-                  "weight conversion kernel launch failed: " +
-                      std::string(cudaGetErrorString(status)));
-
   check_cublas(
-      cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                  static_cast<int>(hidden_size), static_cast<int>(rows),
-                  static_cast<int>(vocab_size), &one, weight_float_ptr,
-                  static_cast<int>(hidden_size), exp_weights_ptr,
-                  static_cast<int>(vocab_size), &zero, local_soft_part_ptr,
-                  static_cast<int>(hidden_size)),
+      cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                   static_cast<int>(hidden_size), static_cast<int>(rows),
+                   static_cast<int>(vocab_size), &one, weight_ptr, CUDA_R_16BF,
+                   static_cast<int>(hidden_size), exp_weights_ptr, CUDA_R_16BF,
+                   static_cast<int>(vocab_size), &zero, local_soft_part_ptr,
+                   CUDA_R_32F, static_cast<int>(hidden_size),
+                   CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
       "local-state soft-part GEMM");
 }
 
