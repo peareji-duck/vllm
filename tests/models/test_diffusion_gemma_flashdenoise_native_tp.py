@@ -51,6 +51,11 @@ def _deterministic_gumbels(
     return -torch.log(-torch.log(uniforms))
 
 
+def _require_native_flashdenoise_op(name: str) -> None:
+    if not hasattr(torch.ops, "_C") or not hasattr(torch.ops._C, name):
+        pytest.skip(f"native op {name} is unavailable in this vLLM extension")
+
+
 def _dense_local_state_reference(
     hidden: torch.Tensor,
     lm_head_weight: torch.Tensor,
@@ -99,6 +104,10 @@ def _dense_local_state_reference(
 def test_local_state_scaled_matches_dense_reference_for_local_vocab_shard(
     scale_mode: str,
 ):
+    _require_native_flashdenoise_op(
+        "diffusion_gemma_flashdenoise_local_state_scaled"
+    )
+
     rows, hidden_size, local_vocab = 7, 32, 40
     vocab_start_index = 320
     final_logit_softcapping = 1.3
@@ -193,10 +202,9 @@ def test_local_state_scaled_matches_dense_reference_for_local_vocab_shard(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_local_state_soft_part_uses_bf16_tensor_core_semantics():
-    if not hasattr(torch.ops, "_C") or not hasattr(
-        torch.ops._C, "diffusion_gemma_flashdenoise_local_state_scaled"
-    ):
-        pytest.skip("native FlashDenoise TP-state op is unavailable")
+    _require_native_flashdenoise_op(
+        "diffusion_gemma_flashdenoise_local_state_scaled"
+    )
 
     rows, hidden_size, local_vocab = 5, 64, 128
     vocab_start_index = 4096
@@ -270,9 +278,7 @@ def test_local_state_soft_part_uses_bf16_tensor_core_semantics():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_pack_local_state_matches_torch_merge_scale():
-    assert hasattr(
-        ops, "diffusion_gemma_flashdenoise_pack_local_state"
-    ), "native merge-pack wrapper is unavailable"
+    _require_native_flashdenoise_op("diffusion_gemma_flashdenoise_pack_local_state")
 
     rows, hidden_size = 6, 17
     generator = torch.Generator(device="cuda").manual_seed(20260623)

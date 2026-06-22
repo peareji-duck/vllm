@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
 import torch
 
 from vllm.model_executor.models.diffusion_gemma import (
@@ -64,6 +65,66 @@ def test_local_vocab_softmax_stats_matches_dense_softmax_with_padding():
 
     torch.testing.assert_close(entropy, expected_entropy)
     torch.testing.assert_close(soft_embeds, expected_soft)
+
+
+@pytest.mark.parametrize("seed", [0, 1, 20260622])
+def test_local_vocab_softmax_stats_random_shards_match_dense(seed: int):
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    rows, canvas, vocab_size, hidden = 4, 5, 29, 11
+    scaled = torch.randn(rows, canvas, vocab_size, generator=generator)
+    embed_weight = torch.randn(vocab_size, hidden, generator=generator)
+    normalizer = torch.tensor(1.25)
+    shard_widths = [7, 3, 11, 8]
+
+    global_max = scaled.float().max(dim=-1).values
+    packs = []
+    start = 0
+    for width in shard_widths:
+        end = start + width
+        packs.append(
+            _packed_softmax_parts(
+                scaled[..., start:end],
+                embed_weight[start:end],
+                global_max,
+            )
+        )
+        start = end
+
+    rank = 2
+    rank_start = sum(shard_widths[:rank])
+    rank_width = shard_widths[rank]
+    rank_logits = torch.cat(
+        [
+            scaled[..., rank_start : rank_start + rank_width],
+            torch.full((rows, canvas, 2), 9999.0),
+        ],
+        dim=-1,
+    )
+    rank_weight = torch.cat(
+        [
+            embed_weight[rank_start : rank_start + rank_width],
+            torch.zeros(2, hidden),
+        ],
+        dim=0,
+    )
+    other_pack = sum(pack for index, pack in enumerate(packs) if index != rank)
+
+    entropy, soft_embeds = _local_vocab_softmax_stats(
+        rank_logits,
+        rank_weight,
+        normalizer,
+        local_vocab_width=rank_width,
+        global_max=global_max,
+        all_reduce_sum_fn=lambda packed: packed + other_pack,
+    )
+
+    dense_log_probs = scaled.log_softmax(dim=-1)
+    dense_probs = dense_log_probs.exp()
+    expected_entropy = -(dense_probs * dense_log_probs).sum(dim=-1)
+    expected_soft = torch.matmul(dense_probs, embed_weight) * normalizer
+
+    torch.testing.assert_close(entropy, expected_entropy, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(soft_embeds, expected_soft, atol=1e-5, rtol=1e-5)
 
 
 def test_local_vocab_argmax_ignores_padded_vocab_columns():
