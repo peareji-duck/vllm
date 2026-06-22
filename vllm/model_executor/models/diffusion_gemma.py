@@ -771,7 +771,7 @@ def _local_vocab_requires_full_logprobs(
     *,
     req_ids: Iterable[str] | None = None,
 ) -> bool:
-    if max_num_logprobs < 0:
+    if max_num_logprobs <= 0:
         return False
     return not (req_ids is not None and _is_sampler_warmup_batch(req_ids))
 
