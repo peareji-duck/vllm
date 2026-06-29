@@ -37,6 +37,11 @@ from vllm.distributed import (
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.consumer_state_trace import (
+    emit_compact_vocab_state_trace,
+    emit_full_vocab_trace,
+    tensor_nbytes,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -88,6 +93,8 @@ _DIFFUSION_GEMMA_FLASHDENOISE_MODE16 = 16
 _DIFFUSION_GEMMA_FLASHDENOISE_FULL_MAX_ROWS = 1024
 _DIFFUSION_GEMMA_FLASHDENOISE_FULL_MAX_HIDDEN = 4096
 _DIFFUSION_GEMMA_FLASHDENOISE_MAX_VOCAB = 262144
+_TRACE_FLOAT32_BYTES = 4
+_TRACE_INT64_BYTES = 8
 
 
 class DiffusionGemmaSelfConditioning(nn.Module):
@@ -742,6 +749,22 @@ def _tp_rank_in_group() -> int:
     return int(get_tp_group().rank_in_group)
 
 
+def _trace_argmax_reduce_bytes(*, rows: int, lanes: int, tp_size: int) -> int:
+    if int(tp_size) <= 1:
+        return 0
+    return int(rows) * int(lanes) * int(tp_size) * (
+        _TRACE_FLOAT32_BYTES + _TRACE_INT64_BYTES
+    )
+
+
+def _trace_soft_state_reduce_bytes(
+    *, rows: int, hidden_size: int, tp_size: int
+) -> int:
+    if int(tp_size) <= 1:
+        return 0
+    return int(rows) * (int(hidden_size) + 2) * int(tp_size) * _TRACE_FLOAT32_BYTES
+
+
 def _local_vocab_generator_seed(rank: int) -> int:
     return 0xD1FF600D + int(rank)
 
@@ -848,7 +871,17 @@ def _local_vocab_logprobs_dense_fallback(
     if logits.shape[-1] == vocab_size or num_decode == 0:
         return logits
     gathered = all_gather_fn(logits.reshape(num_decode, canvas_length, -1))
-    return gathered[..., :vocab_size].reshape(num_decode * canvas_length, vocab_size)
+    full_logits = gathered[..., :vocab_size].reshape(
+        num_decode * canvas_length, vocab_size
+    )
+    emit_full_vocab_trace(
+        component="vllm.diffusion_gemma.local_vocab_logprobs_dense_fallback",
+        full_logits=full_logits,
+        vocab_size=vocab_size,
+        consumer_contract="diffusion_gemma_logprobs",
+        fallback_reason="full_vocab_logprobs_request",
+    )
+    return full_logits
 
 
 @torch.compile(dynamic=True)
@@ -1866,6 +1899,33 @@ class DiffusionSampler:
             torch.stack([sample_values, clean_values], dim=-1),
             torch.stack([sample_indices, clean_indices], dim=-1),
         )
+        tp_size = int(get_tp_group().world_size)
+        emit_compact_vocab_state_trace(
+            component="vllm.diffusion_gemma.native_tp_state",
+            rows=rows,
+            vocab_size=self.vocab_size,
+            local_vocab_size=local_vocab_width,
+            local_vocab_materialized_bytes=(
+                rows * local_vocab_width * _TRACE_FLOAT32_BYTES
+            ),
+            compact_state_bytes=(
+                tensor_nbytes(token_entropy)
+                + tensor_nbytes(soft_embeds)
+                + tensor_nbytes(argmax_indices)
+            ),
+            tp_gather_bytes=(
+                _trace_argmax_reduce_bytes(rows=rows, lanes=2, tp_size=tp_size)
+                + _trace_soft_state_reduce_bytes(
+                    rows=rows,
+                    hidden_size=hidden_size,
+                    tp_size=tp_size,
+                )
+            ),
+            consumer_contract="diffusion_gemma_sampling_entropy_soft_embed",
+            dtype_bytes=hidden_2d.element_size(),
+            tp_size=tp_size,
+            rank=_tp_rank_in_group(),
+        )
 
         self._apply_denoise_step_outputs(
             decode_slots,
@@ -2268,6 +2328,36 @@ class DiffusionSampler:
             global_max=global_clean_max,
             all_reduce_sum_fn=_tp_all_reduce_sum,
         )
+        tp_size = int(get_tp_group().world_size)
+        emit_compact_vocab_state_trace(
+            component="vllm.diffusion_gemma.local_vocab_sampler",
+            rows=num_decode * CL,
+            vocab_size=self.vocab_size,
+            local_vocab_size=local_vocab_width,
+            local_vocab_materialized_bytes=tensor_nbytes(scaled),
+            compact_state_bytes=(
+                tensor_nbytes(token_entropy)
+                + tensor_nbytes(soft_embeds)
+                + tensor_nbytes(new_tokens)
+                + tensor_nbytes(argmax_tokens)
+            ),
+            tp_gather_bytes=(
+                _trace_argmax_reduce_bytes(
+                    rows=num_decode * CL,
+                    lanes=2,
+                    tp_size=tp_size,
+                )
+                + _trace_soft_state_reduce_bytes(
+                    rows=num_decode * CL,
+                    hidden_size=soft_embeds.shape[-1],
+                    tp_size=tp_size,
+                )
+            ),
+            consumer_contract="diffusion_gemma_sampling_entropy_soft_embed",
+            dtype_bytes=logits.element_size(),
+            tp_size=tp_size,
+            rank=_tp_rank_in_group(),
+        )
         mean_entropy = token_entropy.mean(dim=-1)
         states.confident[decode_slots] = mean_entropy < self.confidence_threshold
 
@@ -2458,6 +2548,19 @@ class DiffusionSampler:
                 num_sampled,
             )
         else:
+            emit_full_vocab_trace(
+                component="vllm.diffusion_gemma.dense_sampler",
+                full_logits=logits,
+                vocab_size=self.vocab_size,
+                consumer_contract=(
+                    "diffusion_gemma_sampling_entropy_soft_embed"
+                ),
+                fallback_reason=(
+                    "local_vocab_disabled"
+                    if logits.shape[-1] == self.vocab_size
+                    else "dense_sampler_tp_fallback"
+                ),
+            )
             random_tokens = torch.randint(
                 0,
                 self.vocab_size,

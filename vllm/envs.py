@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     VLLM_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE: bool = False
     VLLM_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE_TP_STATE: bool = False
     VLLM_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE_MODE_FLAGS: int = 16
+    VLLM_CONSUMER_STATE_TRACE_JSONL: str = ""
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
@@ -831,6 +832,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE_MODE_FLAGS": lambda: int(
         os.getenv("VLLM_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE_MODE_FLAGS", "16")
+    ),
+    "VLLM_CONSUMER_STATE_TRACE_JSONL": lambda: os.getenv(
+        "VLLM_CONSUMER_STATE_TRACE_JSONL", ""
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),

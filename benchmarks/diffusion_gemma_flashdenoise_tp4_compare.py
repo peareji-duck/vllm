@@ -691,6 +691,7 @@ def build_summary(args, mode_envs, shapes, runs, started_at, completed_at):
             "input_len": args.input_len,
             "output_len": args.output_len,
             "repeats": args.repeats,
+            "consumer_state_trace_dir": args.consumer_state_trace_dir,
             "request_rate": args.request_rate,
             "out_dir": args.out_dir,
             "modes": args.modes,
@@ -738,10 +739,20 @@ def execute_run(args, mode, mode_env, shape, repeat_index):
 
     env = os.environ.copy()
     env.update(mode_env)
+    trace_jsonl = None
+    if args.consumer_state_trace_dir:
+        trace_jsonl = os.path.join(args.consumer_state_trace_dir, run_slug + ".jsonl")
+        ensure_dir(os.path.dirname(trace_jsonl))
+        env["VLLM_CONSUMER_STATE_TRACE_JSONL"] = trace_jsonl
+    cache_base = os.environ.get("VLLM_FLASHDENOISE_BENCH_CACHE_ROOT")
+    if cache_base:
+        cache_base = os.path.join(cache_base, safe_part(run_slug))
+    else:
+        cache_base = run_dir
     cache_env = {
-        "TRITON_CACHE_DIR": os.path.join(run_dir, "triton_cache"),
-        "TORCHINDUCTOR_CACHE_DIR": os.path.join(run_dir, "torchinductor_cache"),
-        "CUDA_CACHE_PATH": os.path.join(run_dir, "cuda_cache"),
+        "TRITON_CACHE_DIR": os.path.join(cache_base, "triton_cache"),
+        "TORCHINDUCTOR_CACHE_DIR": os.path.join(cache_base, "torchinductor_cache"),
+        "CUDA_CACHE_PATH": os.path.join(cache_base, "cuda_cache"),
     }
     env.update(cache_env)
 
@@ -760,6 +771,7 @@ def execute_run(args, mode, mode_env, shape, repeat_index):
         "server_log": server_log_path,
         "benchmark_log": benchmark_log_path,
         "result_json": result_path,
+        "consumer_state_trace_jsonl": trace_jsonl,
         "started_at": utc_now(),
     }
 
@@ -903,6 +915,14 @@ def create_argument_parser():
     parser.add_argument("--output-len", type=int, default=4)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--out-dir", required=True)
+    parser.add_argument(
+        "--consumer-state-trace-dir",
+        default=None,
+        help=(
+            "Optional directory for per-run VLLM_CONSUMER_STATE_TRACE_JSONL "
+            "runtime vocab-state traces."
+        ),
+    )
     parser.add_argument(
         "--modes",
         nargs="+",
