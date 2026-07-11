@@ -73,6 +73,19 @@ from .interfaces import (
 logger = init_logger(__name__)
 
 _DIFFUSION_GEMMA_LOCAL_VOCAB_SAMPLER = envs.VLLM_DIFFUSION_GEMMA_LOCAL_VOCAB_SAMPLER
+_DIFFUSION_GEMMA_CONSUMER_STATE_ABLATION = (
+    envs.VLLM_DIFFUSION_GEMMA_CONSUMER_STATE_ABLATION
+)
+
+
+def _validate_consumer_state_ablation_mode(mode: str) -> str:
+    allowed = {"full", "sample_only_dense_consumers"}
+    if mode not in allowed:
+        raise ValueError(
+            f"invalid DiffusionGemma consumer-state ablation mode {mode!r}; "
+            f"expected one of {sorted(allowed)}"
+        )
+    return mode
 
 
 class DiffusionGemmaSelfConditioning(nn.Module):
@@ -546,6 +559,37 @@ def _local_vocab_softmax_stats(
         embed_weight.dtype
     )
     return entropy, soft_embeds * normalizer
+
+
+def _dense_consumers_from_local_scaled_logits(
+    local_scaled_logits: torch.Tensor,
+    embed_weight: torch.Tensor,
+    normalizer: torch.Tensor,
+    *,
+    vocab_size: int,
+    sc_vocab_start: int,
+    sc_vocab_end: int,
+    tp_size: int,
+    all_gather_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    all_reduce_sum_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run entropy and soft embedding in the dense baseline operation order."""
+    if all_gather_fn is None:
+        all_gather_fn = _tp_all_gather_vocab
+    if all_reduce_sum_fn is None:
+        all_reduce_sum_fn = _tp_all_reduce_sum
+    full_scaled_logits = all_gather_fn(local_scaled_logits)[..., :vocab_size]
+    log_probs = full_scaled_logits.log_softmax(dim=-1)
+    probs = log_probs.exp()
+    token_entropy = -(probs * log_probs).sum(dim=-1)
+
+    local_probs = probs[..., sc_vocab_start:sc_vocab_end].to(embed_weight.dtype)
+    soft_embeds = torch.matmul(
+        local_probs, embed_weight[: sc_vocab_end - sc_vocab_start]
+    )
+    if tp_size > 1:
+        soft_embeds = all_reduce_sum_fn(soft_embeds)
+    return token_entropy, soft_embeds * normalizer
 
 
 def _local_vocab_argmax_tokens(
@@ -1338,6 +1382,9 @@ class DiffusionSampler:
         self.tp_size = tp_size
         self.tp_group_name = tp_group_name
         self.seed = seed
+        self.consumer_state_ablation_mode = _validate_consumer_state_ablation_mode(
+            _DIFFUSION_GEMMA_CONSUMER_STATE_ABLATION
+        )
         self.normalizer_float = float(normalizer.detach().cpu().item())
         self.canvas_length = (
             diffusion_config.canvas_length if diffusion_config is not None else 32
@@ -1546,14 +1593,25 @@ class DiffusionSampler:
         argmax_tokens = argmax_indices[..., 1]
         global_clean_max = argmax_values[..., 1]
 
-        token_entropy, soft_embeds = _local_vocab_softmax_stats(
-            scaled,
-            self.embed_weight,
-            self.normalizer,
-            local_vocab_width=local_vocab_width,
-            global_max=global_clean_max,
-            all_reduce_sum_fn=_tp_all_reduce_sum,
-        )
+        if self.consumer_state_ablation_mode == "sample_only_dense_consumers":
+            token_entropy, soft_embeds = _dense_consumers_from_local_scaled_logits(
+                scaled,
+                self.embed_weight,
+                self.normalizer,
+                vocab_size=self.vocab_size,
+                sc_vocab_start=self.sc_vocab_start,
+                sc_vocab_end=self.sc_vocab_end,
+                tp_size=self.tp_size,
+            )
+        else:
+            token_entropy, soft_embeds = _local_vocab_softmax_stats(
+                scaled,
+                self.embed_weight,
+                self.normalizer,
+                local_vocab_width=local_vocab_width,
+                global_max=global_clean_max,
+                all_reduce_sum_fn=_tp_all_reduce_sum,
+            )
         mean_entropy = token_entropy.mean(dim=-1)
         states.confident[decode_slots] = mean_entropy < self.confidence_threshold
 

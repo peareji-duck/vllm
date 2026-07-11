@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_DIFFUSION_GEMMA_LOCAL_VOCAB_SAMPLER: bool = False
+    VLLM_DIFFUSION_GEMMA_CONSUMER_STATE_ABLATION: str = "full"
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
@@ -828,6 +829,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sampling, entropy, and soft self-conditioning on TP vocab shards.
     "VLLM_DIFFUSION_GEMMA_LOCAL_VOCAB_SAMPLER": lambda: bool(
         int(os.getenv("VLLM_DIFFUSION_GEMMA_LOCAL_VOCAB_SAMPLER", "0"))
+    ),
+    "VLLM_DIFFUSION_GEMMA_CONSUMER_STATE_ABLATION": lambda: os.getenv(
+        "VLLM_DIFFUSION_GEMMA_CONSUMER_STATE_ABLATION", "full"
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
