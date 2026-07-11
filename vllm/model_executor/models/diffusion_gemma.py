@@ -16,7 +16,8 @@ via Gemma4MultimodalEmbedder.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
 
@@ -26,8 +27,13 @@ from torch import nn
 from torch.nn import functional as F
 from transformers import AutoModel
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed import (
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -65,6 +71,8 @@ from .interfaces import (
 )
 
 logger = init_logger(__name__)
+
+_DIFFUSION_GEMMA_LOCAL_VOCAB_SAMPLER = envs.VLLM_DIFFUSION_GEMMA_LOCAL_VOCAB_SAMPLER
 
 
 class DiffusionGemmaSelfConditioning(nn.Module):
@@ -131,6 +139,19 @@ def _softcap_logits(logits: torch.Tensor, cap: float) -> torch.Tensor:
     # the [num_tokens, vocab] logits instead of four separate passes.
     logits = logits.float()
     return torch.tanh(logits / cap) * cap
+
+
+def _compute_local_lm_head_logits(
+    lm_head: ParallelLMHead,
+    hidden_states: torch.Tensor,
+    *,
+    final_logit_softcapping: float | None,
+    embedding_bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
+    if final_logit_softcapping is not None:
+        logits = _softcap_logits(logits, final_logit_softcapping)
+    return logits
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -254,6 +275,7 @@ class DiffusionGemmaForConditionalGeneration(
             text_config.vocab_size,
             soft_cap=None,
         )
+        self._allow_local_vocab_logits = False
 
         sc_size = (
             getattr(config, "self_conditioning_size", None)
@@ -331,10 +353,26 @@ class DiffusionGemmaForConditionalGeneration(
             **kwargs,
         )
 
+    @contextmanager
+    def enable_local_vocab_logits(self):
+        previous = self._allow_local_vocab_logits
+        self._allow_local_vocab_logits = True
+        try:
+            yield
+        finally:
+            self._allow_local_vocab_logits = previous
+
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
-        logits = self.logits_processor(self.lm_head, hidden_states)
-        if logits is not None and self.final_logit_softcapping is not None:
-            logits = _softcap_logits(logits, self.final_logit_softcapping)
+        if _DIFFUSION_GEMMA_LOCAL_VOCAB_SAMPLER and self._allow_local_vocab_logits:
+            logits = _compute_local_lm_head_logits(
+                self.lm_head,
+                hidden_states,
+                final_logit_softcapping=self.final_logit_softcapping,
+            )
+        else:
+            logits = self.logits_processor(self.lm_head, hidden_states)
+            if logits is not None and self.final_logit_softcapping is not None:
+                logits = _softcap_logits(logits, self.final_logit_softcapping)
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
@@ -455,6 +493,217 @@ class DiffusionGemmaForConditionalGeneration(
         raise ValueError(f"Unsupported modality: {modality}")
 
 
+def _local_vocab_softmax_stats(
+    scaled_logits: torch.Tensor,
+    embed_weight: torch.Tensor,
+    normalizer: torch.Tensor,
+    *,
+    local_vocab_width: int | None = None,
+    global_max: torch.Tensor | None = None,
+    all_reduce_sum_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    all_reduce_max_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exact softmax entropy and soft embed from local-vocab logits."""
+    if local_vocab_width is not None:
+        local_vocab_width = int(local_vocab_width)
+        if local_vocab_width < 0 or local_vocab_width > scaled_logits.shape[-1]:
+            raise ValueError(
+                f"invalid local vocab width {local_vocab_width} for logits "
+                f"width {scaled_logits.shape[-1]}"
+            )
+        scaled_logits = scaled_logits[..., :local_vocab_width]
+        embed_weight = embed_weight[:local_vocab_width]
+
+    logits_f = scaled_logits.float()
+    if global_max is None:
+        local_max = logits_f.max(dim=-1).values
+        global_max = (
+            all_reduce_max_fn(local_max) if all_reduce_max_fn is not None else local_max
+        )
+    else:
+        global_max = global_max.float()
+
+    local_exp = torch.exp(logits_f - global_max.unsqueeze(-1))
+    local_sum_exp = local_exp.sum(dim=-1)
+    weighted_logits = (local_exp * logits_f).sum(dim=-1)
+    soft_part = torch.matmul(local_exp.to(embed_weight.dtype), embed_weight).float()
+    packed = torch.cat(
+        [
+            local_sum_exp.unsqueeze(-1),
+            weighted_logits.unsqueeze(-1),
+            soft_part,
+        ],
+        dim=-1,
+    )
+    packed = all_reduce_sum_fn(packed) if all_reduce_sum_fn is not None else packed
+    global_sum_exp = packed[..., 0]
+    global_weighted_logits = packed[..., 1]
+
+    log_z = torch.log(global_sum_exp) + global_max
+    entropy = log_z - (global_weighted_logits / global_sum_exp)
+    global_soft_part = packed[..., 2:]
+    soft_embeds = (global_soft_part / global_sum_exp.unsqueeze(-1)).to(
+        embed_weight.dtype
+    )
+    return entropy, soft_embeds * normalizer
+
+
+def _local_vocab_argmax_tokens(
+    logits: torch.Tensor,
+    *,
+    vocab_start_index: int,
+    local_vocab_width: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return max values and global token ids for local-vocab logits."""
+    if local_vocab_width is not None:
+        local_vocab_width = int(local_vocab_width)
+        if local_vocab_width < 0 or local_vocab_width > logits.shape[-1]:
+            raise ValueError(
+                f"invalid local vocab width {local_vocab_width} for logits "
+                f"width {logits.shape[-1]}"
+            )
+        logits = logits[..., :local_vocab_width]
+    if logits.shape[-1] == 0:
+        local_values = logits.new_full(logits.shape[:-1], -float("inf"))
+        global_indices = torch.full(
+            logits.shape[:-1],
+            torch.iinfo(torch.int64).max,
+            device=logits.device,
+            dtype=torch.int64,
+        )
+        return local_values, global_indices
+
+    local_values, local_indices = logits.max(dim=-1)
+    global_indices = local_indices.to(torch.int64) + int(vocab_start_index)
+    return local_values, global_indices
+
+
+def _reduce_argmax_from_gathered_pairs(
+    local_values: torch.Tensor,
+    local_indices: torch.Tensor,
+    gathered_pairs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    gathered_values = gathered_pairs[..., 0]
+    gathered_indices = gathered_pairs[..., 1].to(torch.int64)
+    winning_values = gathered_values.max(dim=-1, keepdim=True).values
+    max_index = torch.iinfo(gathered_indices.dtype).max
+    tie_break_indices = torch.where(
+        gathered_values == winning_values,
+        gathered_indices,
+        torch.full_like(gathered_indices, max_index),
+    )
+    winning_rank = tie_break_indices.argmin(dim=-1, keepdim=True)
+    values = gathered_values.gather(dim=-1, index=winning_rank).squeeze(-1)
+    indices = gathered_indices.gather(dim=-1, index=winning_rank).squeeze(-1)
+    return values.to(local_values.dtype), indices.to(local_indices.dtype)
+
+
+def _tp_all_reduce_sum(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor_model_parallel_all_reduce(tensor)
+
+
+def _tp_all_reduce_max(tensor: torch.Tensor) -> torch.Tensor:
+    group = get_tp_group()
+    if group.world_size == 1:
+        return tensor
+    out = tensor.clone()
+    torch.distributed.all_reduce(
+        out, op=torch.distributed.ReduceOp.MAX, group=group.device_group
+    )
+    return out
+
+
+def _tp_all_gather_vocab(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor_model_parallel_all_gather(tensor, dim=-1)
+
+
+def _tp_argmax_reduce_multi(
+    local_values: torch.Tensor,
+    global_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    group = get_tp_group()
+    if group.world_size == 1:
+        return local_values, global_indices
+    gathered_values = tensor_model_parallel_all_gather(
+        local_values.float(), dim=-1
+    ).view(*local_values.shape[:-1], group.world_size, local_values.shape[-1])
+    gathered_indices = tensor_model_parallel_all_gather(
+        global_indices.to(torch.int64), dim=-1
+    ).view(*global_indices.shape[:-1], group.world_size, global_indices.shape[-1])
+    gathered_values = gathered_values.transpose(-1, -2)
+    gathered_indices = gathered_indices.transpose(-1, -2)
+    gathered_pairs = torch.stack(
+        [gathered_values, gathered_indices.to(gathered_values.dtype)], dim=-1
+    )
+    return _reduce_argmax_from_gathered_pairs(
+        local_values, global_indices, gathered_pairs
+    )
+
+
+def _tp_rank_in_group() -> int:
+    return int(get_tp_group().rank_in_group)
+
+
+def _local_vocab_generator_seed(engine_seed: int, rank: int) -> int:
+    return (int(engine_seed) + 0xD1FF600D + int(rank) * 0x9E3779B1) % torch.iinfo(
+        torch.int64
+    ).max
+
+
+def _tp_broadcast_from_rank0(tensor: torch.Tensor) -> torch.Tensor:
+    group = get_tp_group()
+    if group.world_size == 1:
+        return tensor
+    return group.broadcast(tensor, src=0)
+
+
+def _should_use_local_vocab_sampler(
+    logits: torch.Tensor | None,
+    num_decode: int,
+    *,
+    vocab_size: int,
+) -> bool:
+    return (
+        _DIFFUSION_GEMMA_LOCAL_VOCAB_SAMPLER
+        and num_decode > 0
+        and logits is not None
+        and logits.shape[-1] != vocab_size
+    )
+
+
+def _is_sampler_warmup_batch(req_ids: Iterable[str]) -> bool:
+    req_ids = list(req_ids)
+    return bool(req_ids) and all(req_id.startswith("_warmup_") for req_id in req_ids)
+
+
+def _local_vocab_requires_full_logprobs(
+    max_num_logprobs: int,
+    *,
+    req_ids: Iterable[str] | None = None,
+) -> bool:
+    if max_num_logprobs < 0:
+        return False
+    return not (req_ids is not None and _is_sampler_warmup_batch(req_ids))
+
+
+def _local_vocab_logprobs_dense_fallback(
+    logits: torch.Tensor,
+    *,
+    num_decode: int,
+    canvas_length: int,
+    vocab_size: int,
+    all_gather_fn: Callable[[torch.Tensor], torch.Tensor] = _tp_all_gather_vocab,
+) -> torch.Tensor:
+    """Materialize dense logits only for logprobs requests."""
+    if logits.shape[-1] == vocab_size or num_decode == 0:
+        return logits
+    gathered = all_gather_fn(logits.reshape(num_decode, canvas_length, -1))
+    full_logits = gathered[..., :vocab_size].reshape(
+        num_decode * canvas_length, vocab_size
+    )
+    return full_logits
+
+
 @torch.compile(dynamic=True)
 def _compute_num_rejected(
     num_logits: torch.Tensor,
@@ -569,7 +818,8 @@ def _compiled_sample_step(
     )
     step_tensor[decode_slots] = new_step_val
 
-    # Random tokens for renoise / canvas reinit
+    # Random tokens for renoise / canvas reinit. Keep this draw after the
+    # Gumbel draw above to preserve the upstream dense sampler RNG order.
     random_tokens = torch.randint(
         0, vocab_size, (num_decode, CL), device=device, dtype=canvas.dtype
     )
@@ -743,6 +993,10 @@ class DiffusionGemmaRequestStates:
             dtype=torch.int64,
             device=self.device,
         )
+        if _DIFFUSION_GEMMA_LOCAL_VOCAB_SAMPLER:
+            self.canvas[slot_indices_np] = _tp_broadcast_from_rank0(
+                self.canvas[slot_indices_np]
+            )
 
     def add_request(self, slot_idx: int) -> None:
         self.is_encoder_phase[slot_idx] = True
@@ -850,11 +1104,14 @@ class DiffusionGemmaModelState(ModelState):
             entropy_bound=entropy_bound,
             confidence_threshold=gen["confidence_threshold"],
             embed_weight=embed_tokens.weight,
+            embed_vocab_start_index=(shard.org_vocab_start_index),
+            embed_vocab_end_index=(shard.org_vocab_end_index),
             normalizer=self.model.model.normalizer,
             sc_vocab_start=shard.org_vocab_start_index,
             sc_vocab_end=shard.org_vocab_end_index,
             tp_size=tp_group.world_size,
             tp_group_name=tp_group.unique_name,
+            seed=self.model_config.seed,
         ), None
 
     def apply_staged_writes(self) -> None:
@@ -1056,11 +1313,14 @@ class DiffusionSampler:
         t_max: float,
         entropy_bound: float,
         embed_weight: torch.Tensor,
+        embed_vocab_start_index: int,
+        embed_vocab_end_index: int,
         normalizer: torch.Tensor,
         sc_vocab_start: int = 0,
         sc_vocab_end: int | None = None,
         tp_size: int = 1,
         tp_group_name: str = "",
+        seed: int = 0,
     ):
         self.sampling_states = sampler.sampling_states
         self.req_states = sampler.req_states
@@ -1070,11 +1330,15 @@ class DiffusionSampler:
         # rank's slice of the full vocab and tp_* drive the cross-rank
         # all-reduce.
         self.embed_weight = embed_weight
+        self.embed_vocab_start_index = embed_vocab_start_index
+        self.embed_vocab_end_index = embed_vocab_end_index
         self.normalizer = normalizer
         self.sc_vocab_start = sc_vocab_start
         self.sc_vocab_end = sc_vocab_end if sc_vocab_end is not None else vocab_size
         self.tp_size = tp_size
         self.tp_group_name = tp_group_name
+        self.seed = seed
+        self.normalizer_float = float(normalizer.detach().cpu().item())
         self.canvas_length = (
             diffusion_config.canvas_length if diffusion_config is not None else 32
         )
@@ -1107,6 +1371,16 @@ class DiffusionSampler:
         # Populated after the post-sample kernel detects convergence; consumed
         # on the subsequent commit step when num_sampled=CANVAS_LEN.
         self._pending_logprobs: dict[int, LogprobsTensors] = {}
+        self._local_vocab_generator: torch.Generator | None = None
+
+    def _get_local_vocab_generator(self, device: torch.device) -> torch.Generator:
+        if self._local_vocab_generator is None:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(
+                _local_vocab_generator_seed(self.seed, _tp_rank_in_group())
+            )
+            self._local_vocab_generator = generator
+        return self._local_vocab_generator
 
     def add_request(self, req_idx: int, prompt_len: int, sampling_params: Any) -> None:
         if use_penalty(sampling_params):
@@ -1215,6 +1489,164 @@ class DiffusionSampler:
             num_rejected=num_rejected,
         )
 
+    def _sample_local_vocab_step(
+        self,
+        logits: torch.Tensor,
+        decode_slots: torch.Tensor,
+        decode_idx: torch.Tensor,
+        all_slots: torch.Tensor,
+        valid_canvas_len: torch.Tensor,
+        is_committing: torch.Tensor,
+        sampled: torch.Tensor,
+        num_sampled: torch.Tensor,
+    ) -> torch.Tensor:
+        """Denoise step for vocab-sharded logits."""
+        states = self.diffusion_states
+        num_decode = decode_slots.shape[0]
+        device = decode_slots.device
+        CL = self.canvas_length
+        ST = states.stability_threshold
+
+        sampled.zero_()
+        num_sampled.zero_()
+
+        steps_f = states.step[decode_slots].float()
+        remaining = (states.max_denoising_steps - steps_f).clamp(min=1.0)
+        temp = self.t_min + (self.t_max - self.t_min) * (
+            remaining / states.max_denoising_steps
+        )
+
+        logits_3d = logits.reshape(num_decode, CL, -1).float()
+        scaled = logits_3d / temp[:, None, None].clamp(min=1e-10)
+        local_vocab_width = self.embed_vocab_end_index - self.embed_vocab_start_index
+
+        u = torch.rand(
+            scaled.shape,
+            device=device,
+            dtype=scaled.dtype,
+            generator=self._get_local_vocab_generator(device),
+        ).clamp(min=1e-20)
+        gumbel = -torch.log(-torch.log(u))
+        noisy = scaled + gumbel * (temp[:, None, None] > 0).float()
+        local_noisy_values, local_new_tokens = _local_vocab_argmax_tokens(
+            noisy,
+            vocab_start_index=self.embed_vocab_start_index,
+            local_vocab_width=local_vocab_width,
+        )
+        local_clean_values, local_argmax_tokens = _local_vocab_argmax_tokens(
+            scaled,
+            vocab_start_index=self.embed_vocab_start_index,
+            local_vocab_width=local_vocab_width,
+        )
+        argmax_values, argmax_indices = _tp_argmax_reduce_multi(
+            torch.stack([local_noisy_values, local_clean_values], dim=-1),
+            torch.stack([local_new_tokens, local_argmax_tokens], dim=-1),
+        )
+        new_tokens = argmax_indices[..., 0]
+        argmax_tokens = argmax_indices[..., 1]
+        global_clean_max = argmax_values[..., 1]
+
+        token_entropy, soft_embeds = _local_vocab_softmax_stats(
+            scaled,
+            self.embed_weight,
+            self.normalizer,
+            local_vocab_width=local_vocab_width,
+            global_max=global_clean_max,
+            all_reduce_sum_fn=_tp_all_reduce_sum,
+        )
+        mean_entropy = token_entropy.mean(dim=-1)
+        states.confident[decode_slots] = mean_entropy < self.confidence_threshold
+
+        sorted_ent, sorted_idx = torch.sort(token_entropy, dim=-1)
+        cumsum_ent = torch.cumsum(sorted_ent, dim=-1)
+        cummax_ent = torch.cummax(sorted_ent, dim=-1).values
+        sorted_mask = (cumsum_ent - cummax_ent) <= self.entropy_bound
+        eb_mask = torch.zeros_like(sorted_mask)
+        eb_mask.scatter_(1, sorted_idx, sorted_mask)
+
+        is_commit = is_committing
+        is_denoise = ~is_commit
+        cur_step = states.step[decode_slots].float()
+        new_step_val = torch.where(
+            is_denoise,
+            (cur_step + 1).to(states.step.dtype),
+            states.step.new_zeros(num_decode),
+        )
+        states.step[decode_slots] = new_step_val
+
+        random_tokens = torch.randint(
+            0,
+            self.vocab_size,
+            (num_decode, CL),
+            device=device,
+            dtype=states.canvas.dtype,
+        )
+        random_tokens = _tp_broadcast_from_rank0(random_tokens)
+        denoise_canvas = torch.where(eb_mask, new_tokens, random_tokens)
+        states.canvas[decode_slots] = torch.where(
+            is_commit.unsqueeze(1), random_tokens, denoise_canvas
+        )
+
+        hist_len = states.accepted_canvas_history_len[decode_slots]
+        write_pos = hist_len % ST
+        for i in range(ST):
+            write_here = ((write_pos == i) & is_denoise).unsqueeze(1)
+            states.accepted_canvas_history[decode_slots, i] = torch.where(
+                write_here,
+                argmax_tokens,
+                states.accepted_canvas_history[decode_slots, i],
+            )
+
+        states.argmax_canvas[decode_slots] = torch.where(
+            is_denoise.unsqueeze(1), argmax_tokens, states.argmax_canvas[decode_slots]
+        )
+
+        new_hist_len = torch.where(
+            is_denoise, hist_len + 1, hist_len.new_zeros(num_decode)
+        )
+        states.accepted_canvas_history_len[decode_slots] = new_hist_len
+
+        sampled[decode_idx] = states.argmax_canvas[decode_slots].to(
+            sampled.dtype
+        ) * is_commit.unsqueeze(1).to(sampled.dtype)
+        num_sampled[decode_idx] = is_commit.to(num_sampled.dtype) * valid_canvas_len.to(
+            num_sampled.dtype
+        )
+
+        ref = states.accepted_canvas_history[decode_slots, 0]
+        mismatch = torch.zeros(num_decode, device=device, dtype=torch.int32)
+        for h in range(1, ST):
+            mismatch = (
+                mismatch
+                + (ref != states.accepted_canvas_history[decode_slots, h])
+                .sum(dim=-1)
+                .int()
+            )
+        stable = mismatch == 0
+
+        step_after = states.step[decode_slots]
+        converged = (stable & states.confident[decode_slots] & (new_hist_len >= ST)) | (
+            step_after >= states.max_denoising_steps
+        )
+        states.is_encoder_phase[decode_slots] = torch.where(
+            is_commit, is_commit.new_zeros(num_decode), converged
+        )
+
+        sc_keep = (is_denoise & ~states.is_encoder_phase[decode_slots])[:, None, None]
+        states.self_conditioning_embeds[decode_slots] = (soft_embeds * sc_keep).to(
+            states.self_conditioning_embeds.dtype
+        )
+
+        newly_converged = (converged & is_denoise).unsqueeze(1)
+        states.canvas[decode_slots] = torch.where(
+            newly_converged,
+            states.argmax_canvas[decode_slots],
+            states.canvas[decode_slots],
+        )
+
+        self.req_states.draft_tokens[all_slots, :CL] = states.canvas[all_slots]
+        return scaled
+
     # ------------------------------------------------------------------
     # Main entry point
     # ------------------------------------------------------------------
@@ -1284,10 +1716,50 @@ class DiffusionSampler:
         # Snapshot which slots are committing BEFORE the compiled step runs,
         # since it mutates is_encoder_phase (commit→False, converge→True).
         is_committing = states.is_encoder_phase[decode_slots].clone()
-
         slots_np = input_batch.idx_mapping_np[:num_reqs]
         is_decode_np = per_req_nlogits_np > 0
         max_num_logprobs = self.sampling_states.max_num_logprobs(slots_np)
+
+        use_local_vocab = _should_use_local_vocab_sampler(
+            logits, num_decode, vocab_size=self.vocab_size
+        )
+        local_vocab_dense_fallback = False
+        if use_local_vocab and _local_vocab_requires_full_logprobs(
+            max_num_logprobs,
+            req_ids=getattr(input_batch, "req_ids", [])[:num_reqs],
+        ):
+            logits = _local_vocab_logprobs_dense_fallback(
+                logits,
+                num_decode=num_decode,
+                canvas_length=CL,
+                vocab_size=self.vocab_size,
+            )
+            use_local_vocab = False
+            local_vocab_dense_fallback = True
+            logger.warning_once(
+                "VLLM_DIFFUSION_GEMMA_LOCAL_VOCAB_SAMPLER=1 falling back to "
+                "dense logits for full-vocab logprobs."
+            )
+
+        if use_local_vocab:
+            self._sample_local_vocab_step(
+                logits,
+                decode_slots,
+                decode_idx,
+                all_slots,
+                valid_canvas_len,
+                is_committing,
+                sampled,
+                num_sampled,
+            )
+            return self._build_output(
+                input_batch,
+                sampled,
+                num_sampled,
+                per_req_nlogits_np,
+                device,
+                logprobs_tensors=None,
+            )
 
         # Sample over the [num_decode * CL, vocab] logits. The fp32 pipeline in
         # _compiled_sample_step keeps several live [group * CL, vocab] copies, so
@@ -1364,6 +1836,12 @@ class DiffusionSampler:
                             max_num_logprobs,
                             argmax_tokens[local_idx][:k_i],
                         )
+
+        if local_vocab_dense_fallback and get_tp_group().world_size != 1:
+            states.canvas[decode_slots] = _tp_broadcast_from_rank0(
+                states.canvas[decode_slots]
+            )
+            self.req_states.draft_tokens[all_slots, :CL] = states.canvas[all_slots]
 
         # Commit steps: is_committing was True at entry. Reassemble previously
         # stashed logprobs and attach to SamplerOutput.
