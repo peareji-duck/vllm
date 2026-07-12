@@ -16,8 +16,11 @@ via Gemma4MultimodalEmbedder.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -76,6 +79,8 @@ _DIFFUSION_GEMMA_LOCAL_VOCAB_SAMPLER = envs.VLLM_DIFFUSION_GEMMA_LOCAL_VOCAB_SAM
 _DIFFUSION_GEMMA_CONSUMER_STATE_ABLATION = (
     envs.VLLM_DIFFUSION_GEMMA_CONSUMER_STATE_ABLATION
 )
+_DIFFUSION_GEMMA_FIXED_RANDOM_TAPE = envs.VLLM_DIFFUSION_GEMMA_FIXED_RANDOM_TAPE
+_DIFFUSION_GEMMA_TRAJECTORY_DIR = envs.VLLM_DIFFUSION_GEMMA_TRAJECTORY_DIR
 
 
 def _validate_consumer_state_ablation_mode(mode: str) -> str:
@@ -539,26 +544,25 @@ def _local_vocab_softmax_stats(
     local_exp = torch.exp(logits_f - global_max.unsqueeze(-1))
     local_sum_exp = local_exp.sum(dim=-1)
     weighted_logits = (local_exp * logits_f).sum(dim=-1)
-    soft_part = torch.matmul(local_exp.to(embed_weight.dtype), embed_weight).float()
-    packed = torch.cat(
+    stats = torch.cat(
         [
             local_sum_exp.unsqueeze(-1),
             weighted_logits.unsqueeze(-1),
-            soft_part,
         ],
         dim=-1,
     )
-    packed = all_reduce_sum_fn(packed) if all_reduce_sum_fn is not None else packed
-    global_sum_exp = packed[..., 0]
-    global_weighted_logits = packed[..., 1]
+    stats = all_reduce_sum_fn(stats) if all_reduce_sum_fn is not None else stats
+    global_sum_exp = stats[..., 0]
+    global_weighted_logits = stats[..., 1]
 
     log_z = torch.log(global_sum_exp) + global_max
     entropy = log_z - (global_weighted_logits / global_sum_exp)
-    global_soft_part = packed[..., 2:]
-    soft_embeds = (global_soft_part / global_sum_exp.unsqueeze(-1)).to(
-        embed_weight.dtype
+    local_probs = (local_exp / global_sum_exp.unsqueeze(-1)).to(embed_weight.dtype)
+    soft_embeds = torch.matmul(local_probs, embed_weight).float()
+    soft_embeds = (
+        all_reduce_sum_fn(soft_embeds) if all_reduce_sum_fn is not None else soft_embeds
     )
-    return entropy, soft_embeds * normalizer
+    return entropy, soft_embeds.to(embed_weight.dtype) * normalizer
 
 
 def _dense_consumers_from_local_scaled_logits(
@@ -748,6 +752,83 @@ def _local_vocab_logprobs_dense_fallback(
     return full_logits
 
 
+def _diffusion_tape_row_keys(
+    request_keys: torch.Tensor,
+    steps: torch.Tensor,
+    *,
+    canvas_length: int,
+) -> torch.Tensor:
+    """Stable row keys for benchmark-only counter-keyed randomness."""
+    canvas_positions = torch.arange(
+        canvas_length, device=request_keys.device, dtype=torch.int64
+    )
+    request_steps = request_keys.to(torch.int64) * 1_000_003 + steps.to(torch.int64)
+    return request_steps.unsqueeze(-1) * int(canvas_length) + canvas_positions
+
+
+def _random_tape_request_key(prompt_token_ids: list[int]) -> int:
+    """Hash a prompt into a stable key independent of scheduler slot assignment."""
+    prompt_bytes = np.asarray(prompt_token_ids, dtype=np.int64).tobytes()
+    return (
+        int.from_bytes(hashlib.sha256(prompt_bytes).digest()[:8], "little")
+        % 1_000_000_007
+    )
+
+
+def _counter_based_uniform(
+    row_keys: torch.Tensor,
+    *,
+    vocab_start: int,
+    vocab_width: int,
+    seed: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Generate open-interval uniforms invariant to vocabulary partitioning."""
+    token_ids = torch.arange(
+        int(vocab_start),
+        int(vocab_start) + int(vocab_width),
+        device=row_keys.device,
+        dtype=torch.int64,
+    )
+    modulus = 2_147_483_647
+    values = (
+        row_keys.to(torch.int64).unsqueeze(-1) * 1_103_515_245
+        + token_ids * 12_345
+        + int(seed) * 2_654_435_761
+        + 101_390_4223
+    ).remainder(modulus)
+    return ((values.to(torch.float64) + 0.5) / modulus).to(dtype)
+
+
+def _counter_based_random_tokens(
+    row_keys: torch.Tensor,
+    *,
+    seed: int,
+    vocab_size: int,
+) -> torch.Tensor:
+    """Generate deterministic renoise tokens from the same logical row keys."""
+    modulus = 2_147_483_647
+    values = (
+        row_keys.to(torch.int64) * 1_664_525 + int(seed) * 1_013_904_223 + 69069
+    ).remainder(modulus)
+    return values.remainder(int(vocab_size)).to(torch.int64)
+
+
+def _summarize_trajectory_tensor(tensor: torch.Tensor) -> dict[str, Any]:
+    """Return a stable, compact summary for benchmark-only trajectory logs."""
+    cpu = tensor.detach().contiguous().cpu()
+    raw = cpu.view(torch.uint8).numpy().tobytes()
+    values = cpu.float()
+    return {
+        "shape": list(cpu.shape),
+        "dtype": str(cpu.dtype),
+        "sum": float(values.sum().item()),
+        "l2_squared": float((values * values).sum().item()),
+        "max_abs": float(values.abs().max().item()) if values.numel() else 0.0,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
 @torch.compile(dynamic=True)
 def _compute_num_rejected(
     num_logits: torch.Tensor,
@@ -766,6 +847,7 @@ def _compiled_sample_step(
     logits: torch.Tensor,
     # Request mapping
     decode_slots: torch.Tensor,  # [num_decode] int64 → slot indices
+    random_tape_request_keys: torch.Tensor,  # [num_decode] stable logical keys
     decode_idx: torch.Tensor,  # [num_decode] int64 → position in num_reqs
     all_slots: torch.Tensor,  # [num_reqs] int64 → all slot indices
     valid_canvas_len: torch.Tensor,  # [num_decode] int64 → real canvas length (<=CL)
@@ -801,6 +883,8 @@ def _compiled_sample_step(
     sc_vocab_end: int,
     tp_size: int,
     tp_group_name: str,
+    fixed_random_tape: bool,
+    random_seed: int,
 ) -> torch.Tensor:
     """Compiled decode step: temperature → Gumbel sample → probs/confidence →
     accept/renoise → convergence, all as vectorized PyTorch ops.
@@ -820,7 +904,22 @@ def _compiled_sample_step(
     scaled = logits_3d / temp[:, None, None].clamp(min=1e-10)
 
     # Gumbel-max trick: argmax(logits/T + Gumbel) ~ sample from softmax(logits/T)
-    u = torch.rand_like(scaled).clamp(min=1e-20)
+    if fixed_random_tape:
+        row_keys = _diffusion_tape_row_keys(
+            random_tape_request_keys,
+            step_tensor[decode_slots],
+            canvas_length=CL,
+        )
+        u = _counter_based_uniform(
+            row_keys,
+            vocab_start=0,
+            vocab_width=scaled.shape[-1],
+            seed=random_seed,
+            dtype=scaled.dtype,
+        )
+    else:
+        u = torch.rand_like(scaled)
+    u = u.clamp(min=1e-20)
     gumbel = -torch.log(-torch.log(u))
     # Zero noise when temp==0 (greedy)
     noisy = scaled + gumbel * (temp[:, None, None] > 0).float()
@@ -864,9 +963,14 @@ def _compiled_sample_step(
 
     # Random tokens for renoise / canvas reinit. Keep this draw after the
     # Gumbel draw above to preserve the upstream dense sampler RNG order.
-    random_tokens = torch.randint(
-        0, vocab_size, (num_decode, CL), device=device, dtype=canvas.dtype
-    )
+    if fixed_random_tape:
+        random_tokens = _counter_based_random_tokens(
+            row_keys, seed=random_seed + 17, vocab_size=vocab_size
+        ).to(canvas.dtype)
+    else:
+        random_tokens = torch.randint(
+            0, vocab_size, (num_decode, CL), device=device, dtype=canvas.dtype
+        )
 
     # Compute denoise canvas (accept/renoise)
     denoise_canvas = torch.where(eb_mask, new_tokens, random_tokens)
@@ -967,6 +1071,8 @@ class DiffusionGemmaRequestStates:
         device: torch.device,
         hidden_size: int,
         stability_threshold: int,
+        fixed_random_tape: bool = False,
+        seed: int = 0,
     ):
         self.max_num_reqs = max_num_reqs
         self.canvas_length = canvas_length
@@ -974,6 +1080,8 @@ class DiffusionGemmaRequestStates:
         self.max_denoising_steps = max_denoising_steps
         self.stability_threshold = stability_threshold
         self.device = device
+        self.fixed_random_tape = fixed_random_tape
+        self.seed = seed
 
         self.is_encoder_phase = torch.zeros(
             max_num_reqs, dtype=torch.bool, device=device
@@ -987,6 +1095,9 @@ class DiffusionGemmaRequestStates:
             max_num_reqs,
             dtype=torch.int32,
             device=device,
+        )
+        self.random_tape_request_keys = torch.zeros(
+            max_num_reqs, dtype=torch.int64, device=device
         )
         # Accepted canvas history for stability check
         self.accepted_canvas_history = torch.zeros(
@@ -1030,24 +1141,46 @@ class DiffusionGemmaRequestStates:
     def init_canvas(self, slot_indices_np: np.ndarray) -> None:
         """Initialize canvas with random tokens for the given slots."""
         n = slot_indices_np.shape[0]
-        self.canvas[slot_indices_np] = torch.randint(
-            0,
-            self.vocab_size,
-            (n, self.canvas_length),
-            dtype=torch.int64,
-            device=self.device,
-        )
+        if self.fixed_random_tape:
+            slots = torch.as_tensor(
+                slot_indices_np, dtype=torch.int64, device=self.device
+            )
+            row_keys = _diffusion_tape_row_keys(
+                self.random_tape_request_keys[slots],
+                torch.full_like(slots, -1),
+                canvas_length=self.canvas_length,
+            )
+            initial_tokens = _counter_based_random_tokens(
+                row_keys,
+                seed=self.seed + 31,
+                vocab_size=self.vocab_size,
+            )
+            self.canvas[slot_indices_np] = initial_tokens
+        else:
+            self.canvas[slot_indices_np] = torch.randint(
+                0,
+                self.vocab_size,
+                (n, self.canvas_length),
+                dtype=torch.int64,
+                device=self.device,
+            )
         if _DIFFUSION_GEMMA_LOCAL_VOCAB_SAMPLER:
             self.canvas[slot_indices_np] = _tp_broadcast_from_rank0(
                 self.canvas[slot_indices_np]
             )
 
-    def add_request(self, slot_idx: int) -> None:
+    def add_request(
+        self, slot_idx: int, random_tape_request_key: int | None = None
+    ) -> None:
         self.is_encoder_phase[slot_idx] = True
+        self.random_tape_request_keys[slot_idx] = (
+            slot_idx if random_tape_request_key is None else random_tape_request_key
+        )
         self.init_canvas(torch.tensor([slot_idx], device=self.device))
         self.step[slot_idx] = 0
         self.accepted_canvas_history_len[slot_idx] = 0
         self.self_conditioning_embeds[slot_idx] = 0
+        self.random_tape_request_keys[slot_idx] = 0
 
     def remove_request(self, slot_idx: int) -> None:
         self.is_encoder_phase[slot_idx] = False
@@ -1098,6 +1231,8 @@ class DiffusionGemmaModelState(ModelState):
             # step must match the previous step. In vLLM, the history buffer includes
             # the current step, so we add 1 to match the same behavior.
             stability_threshold=self.gen_config["stability_threshold"] + 1,
+            fixed_random_tape=_DIFFUSION_GEMMA_FIXED_RANDOM_TAPE,
+            seed=self.model_config.seed,
         )
         self._req_id_to_index: dict[str, int] = {}
 
@@ -1163,7 +1298,10 @@ class DiffusionGemmaModelState(ModelState):
 
     def add_request(self, req_index: int, new_req_data: Any) -> None:
         self._req_id_to_index[new_req_data.req_id] = req_index
-        self.diffusion_states.add_request(req_index)
+        request_key = None
+        if _DIFFUSION_GEMMA_FIXED_RANDOM_TAPE:
+            request_key = _random_tape_request_key(new_req_data.prompt_token_ids)
+        self.diffusion_states.add_request(req_index, request_key)
         if not new_req_data.req_id.startswith("_warmup_"):
             prompt_len = len(new_req_data.prompt_token_ids)
             self.diffusion_states.prompt_len[req_index] = prompt_len
@@ -1385,6 +1523,9 @@ class DiffusionSampler:
         self.consumer_state_ablation_mode = _validate_consumer_state_ablation_mode(
             _DIFFUSION_GEMMA_CONSUMER_STATE_ABLATION
         )
+        self.fixed_random_tape = _DIFFUSION_GEMMA_FIXED_RANDOM_TAPE
+        self.trajectory_dir = _DIFFUSION_GEMMA_TRAJECTORY_DIR
+        self._trajectory_call_index = 0
         self.normalizer_float = float(normalizer.detach().cpu().item())
         self.canvas_length = (
             diffusion_config.canvas_length if diffusion_config is not None else 32
@@ -1536,6 +1677,65 @@ class DiffusionSampler:
             num_rejected=num_rejected,
         )
 
+    def _record_trajectory(
+        self,
+        input_batch: Any,
+        decode_slots: torch.Tensor,
+        decode_idx: torch.Tensor,
+        is_committing: torch.Tensor,
+        sampled: torch.Tensor,
+        num_sampled: torch.Tensor,
+        *,
+        path_name: str,
+    ) -> None:
+        if not self.trajectory_dir or decode_slots.numel() == 0:
+            return
+        if _tp_rank_in_group() != 0:
+            return
+
+        states = self.diffusion_states
+        slots = decode_slots.detach().cpu().tolist()
+        indices = decode_idx.detach().cpu().tolist()
+        req_ids = list(getattr(input_batch, "req_ids", []))
+        decoded_req_ids = [
+            str(req_ids[index]) if index < len(req_ids) else f"slot-{slot}"
+            for index, slot in zip(indices, slots)
+        ]
+        record = {
+            "schema_version": 1,
+            "call_index": self._trajectory_call_index,
+            "path": path_name,
+            "req_ids": decoded_req_ids,
+            "slots": slots,
+            "is_committing_before": is_committing.detach().cpu().tolist(),
+            "step_after": states.step[decode_slots].detach().cpu().tolist(),
+            "is_encoder_phase_after": states.is_encoder_phase[decode_slots]
+            .detach()
+            .cpu()
+            .tolist(),
+            "confident_after": states.confident[decode_slots].detach().cpu().tolist(),
+            "history_len_after": states.accepted_canvas_history_len[decode_slots]
+            .detach()
+            .cpu()
+            .tolist(),
+            "canvas_after": states.canvas[decode_slots].detach().cpu().tolist(),
+            "argmax_canvas_after": states.argmax_canvas[decode_slots]
+            .detach()
+            .cpu()
+            .tolist(),
+            "sampled": sampled[decode_idx].detach().cpu().tolist(),
+            "num_sampled": num_sampled[decode_idx].detach().cpu().tolist(),
+            "self_conditioning": _summarize_trajectory_tensor(
+                states.self_conditioning_embeds[decode_slots]
+            ),
+        }
+        output_dir = Path(self.trajectory_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / "trajectory-rank0.jsonl"
+        with output_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+        self._trajectory_call_index += 1
+
     def _sample_local_vocab_step(
         self,
         logits: torch.Tensor,
@@ -1567,12 +1767,27 @@ class DiffusionSampler:
         scaled = logits_3d / temp[:, None, None].clamp(min=1e-10)
         local_vocab_width = self.embed_vocab_end_index - self.embed_vocab_start_index
 
-        u = torch.rand(
-            scaled.shape,
-            device=device,
-            dtype=scaled.dtype,
-            generator=self._get_local_vocab_generator(device),
-        ).clamp(min=1e-20)
+        if self.fixed_random_tape:
+            row_keys = _diffusion_tape_row_keys(
+                states.random_tape_request_keys[decode_slots],
+                states.step[decode_slots],
+                canvas_length=CL,
+            )
+            u = _counter_based_uniform(
+                row_keys,
+                vocab_start=self.embed_vocab_start_index,
+                vocab_width=scaled.shape[-1],
+                seed=self.seed,
+                dtype=scaled.dtype,
+            )
+        else:
+            u = torch.rand(
+                scaled.shape,
+                device=device,
+                dtype=scaled.dtype,
+                generator=self._get_local_vocab_generator(device),
+            )
+        u = u.clamp(min=1e-20)
         gumbel = -torch.log(-torch.log(u))
         noisy = scaled + gumbel * (temp[:, None, None] > 0).float()
         local_noisy_values, local_new_tokens = _local_vocab_argmax_tokens(
@@ -1632,14 +1847,19 @@ class DiffusionSampler:
         )
         states.step[decode_slots] = new_step_val
 
-        random_tokens = torch.randint(
-            0,
-            self.vocab_size,
-            (num_decode, CL),
-            device=device,
-            dtype=states.canvas.dtype,
-        )
-        random_tokens = _tp_broadcast_from_rank0(random_tokens)
+        if self.fixed_random_tape:
+            random_tokens = _counter_based_random_tokens(
+                row_keys, seed=self.seed + 17, vocab_size=self.vocab_size
+            ).to(states.canvas.dtype)
+        else:
+            random_tokens = torch.randint(
+                0,
+                self.vocab_size,
+                (num_decode, CL),
+                device=device,
+                dtype=states.canvas.dtype,
+            )
+            random_tokens = _tp_broadcast_from_rank0(random_tokens)
         denoise_canvas = torch.where(eb_mask, new_tokens, random_tokens)
         states.canvas[decode_slots] = torch.where(
             is_commit.unsqueeze(1), random_tokens, denoise_canvas
@@ -1810,6 +2030,15 @@ class DiffusionSampler:
                 sampled,
                 num_sampled,
             )
+            self._record_trajectory(
+                input_batch,
+                decode_slots,
+                decode_idx,
+                is_committing,
+                sampled,
+                num_sampled,
+                path_name="local_vocab",
+            )
             return self._build_output(
                 input_batch,
                 sampled,
@@ -1840,6 +2069,7 @@ class DiffusionSampler:
             scaled = _compiled_sample_step(
                 logits[start_req * CL : end_req * CL],
                 tile_slots,
+                states.random_tape_request_keys[tile_slots],
                 decode_idx[tile],
                 all_slots,
                 valid_canvas_len[tile],
@@ -1871,6 +2101,8 @@ class DiffusionSampler:
                 sc_vocab_end=self.sc_vocab_end,
                 tp_size=self.tp_size,
                 tp_group_name=self.tp_group_name,
+                fixed_random_tape=self.fixed_random_tape,
+                random_seed=self.seed,
             )
 
             # Logprobs for denoise steps that just converged (is_encoder_phase
@@ -1900,6 +2132,16 @@ class DiffusionSampler:
                 states.canvas[decode_slots]
             )
             self.req_states.draft_tokens[all_slots, :CL] = states.canvas[all_slots]
+
+        self._record_trajectory(
+            input_batch,
+            decode_slots,
+            decode_idx,
+            is_committing,
+            sampled,
+            num_sampled,
+            path_name="dense",
+        )
 
         # Commit steps: is_committing was True at entry. Reassemble previously
         # stashed logprobs and attach to SamplerOutput.

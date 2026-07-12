@@ -49,6 +49,8 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_DIFFUSION_GEMMA_LOCAL_VOCAB_SAMPLER: bool = False
     VLLM_DIFFUSION_GEMMA_CONSUMER_STATE_ABLATION: str = "full"
+    VLLM_DIFFUSION_GEMMA_FIXED_RANDOM_TAPE: bool = False
+    VLLM_DIFFUSION_GEMMA_TRAJECTORY_DIR: str = ""
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
@@ -832,6 +834,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DIFFUSION_GEMMA_CONSUMER_STATE_ABLATION": lambda: os.getenv(
         "VLLM_DIFFUSION_GEMMA_CONSUMER_STATE_ABLATION", "full"
+    ),
+    # Benchmark-only deterministic randomness keyed by logical request, step,
+    # canvas position, and global vocabulary id. Disabled in production.
+    "VLLM_DIFFUSION_GEMMA_FIXED_RANDOM_TAPE": lambda: bool(
+        int(os.getenv("VLLM_DIFFUSION_GEMMA_FIXED_RANDOM_TAPE", "0"))
+    ),
+    "VLLM_DIFFUSION_GEMMA_TRAJECTORY_DIR": lambda: os.getenv(
+        "VLLM_DIFFUSION_GEMMA_TRAJECTORY_DIR", ""
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
