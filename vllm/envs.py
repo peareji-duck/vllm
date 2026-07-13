@@ -48,6 +48,14 @@ if TYPE_CHECKING:
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_DIFFUSION_GEMMA_LOCAL_VOCAB_SAMPLER: bool = False
+    VLLM_DIFFUSION_GEMMA_VALIDATION_VARIANT: Literal[
+        "off",
+        "token_axis_logit_microbatch",
+        "sample_only_dense_consumers",
+        "sample_entropy_state_dense_soft_embed",
+    ] = "off"
+    VLLM_DIFFUSION_GEMMA_TOKEN_MICROBATCH_ROWS: int = 0
+    VLLM_CONSUMER_STATE_PEAK_MEMORY_TRACE_JSONL: str = ""
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
@@ -828,6 +836,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sampling, entropy, and soft self-conditioning on TP vocab shards.
     "VLLM_DIFFUSION_GEMMA_LOCAL_VOCAB_SAMPLER": lambda: bool(
         int(os.getenv("VLLM_DIFFUSION_GEMMA_LOCAL_VOCAB_SAMPLER", "0"))
+    ),
+    # Benchmark-only validation controls for DiffusionGemma consumer-state
+    # experiments. All controls are inert by default.
+    "VLLM_DIFFUSION_GEMMA_VALIDATION_VARIANT": env_with_choices(
+        "VLLM_DIFFUSION_GEMMA_VALIDATION_VARIANT",
+        "off",
+        [
+            "off",
+            "token_axis_logit_microbatch",
+            "sample_only_dense_consumers",
+            "sample_entropy_state_dense_soft_embed",
+        ],
+    ),
+    "VLLM_DIFFUSION_GEMMA_TOKEN_MICROBATCH_ROWS": lambda: int(
+        os.getenv("VLLM_DIFFUSION_GEMMA_TOKEN_MICROBATCH_ROWS", "0")
+    ),
+    "VLLM_CONSUMER_STATE_PEAK_MEMORY_TRACE_JSONL": lambda: os.getenv(
+        "VLLM_CONSUMER_STATE_PEAK_MEMORY_TRACE_JSONL", ""
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),

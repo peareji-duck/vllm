@@ -39,6 +39,10 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.consumer_state_trace import (
+    require_consumer_state_attribution,
+    trace_output_phase_peak,
+)
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -116,6 +120,8 @@ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import KVBlockZeroer
 
 logger = init_logger(__name__)
+_DIFFUSION_GEMMA_VALIDATION_VARIANT = envs.VLLM_DIFFUSION_GEMMA_VALIDATION_VARIANT
+_CONSUMER_STATE_TRACE_ENABLED = bool(envs.VLLM_CONSUMER_STATE_PEAK_MEMORY_TRACE_JSONL)
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -1053,40 +1059,138 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         sample_hidden_states = hidden_states[input_batch.logits_indices]
-        local_vocab_logits_context = nullcontext()
-        if grammar_output is None and self.rejection_sampler is None:
-            enable_local_vocab_logits = getattr(
-                self.model, "enable_local_vocab_logits", None
-            )
-            if enable_local_vocab_logits is not None:
-                local_vocab_logits_context = enable_local_vocab_logits()
-        with local_vocab_logits_context:
-            logits = self.model.compute_logits(sample_hidden_states)
-        if grammar_output is not None:
-            # Apply grammar bitmask to the logits in-place.
-            assert self.structured_outputs_worker is not None
-            self.structured_outputs_worker.apply_grammar_bitmask(
-                logits,
-                input_batch,
-                grammar_output.structured_output_request_ids,
-                grammar_output.grammar_bitmask,
+        validation_variant = _DIFFUSION_GEMMA_VALIDATION_VARIANT
+        if validation_variant == "off" and not _CONSUMER_STATE_TRACE_ENABLED:
+            # Keep the production path identical to the focused PR base. The
+            # validation and profiling controls must be absent from timed runs
+            # unless explicitly enabled.
+            local_vocab_logits_context = nullcontext()
+            if grammar_output is None and self.rejection_sampler is None:
+                enable_local_vocab_logits = getattr(
+                    self.model, "enable_local_vocab_logits", None
+                )
+                if enable_local_vocab_logits is not None:
+                    local_vocab_logits_context = enable_local_vocab_logits()
+            with local_vocab_logits_context:
+                logits = self.model.compute_logits(sample_hidden_states)
+            if grammar_output is not None:
+                # Apply grammar bitmask to the logits in-place.
+                assert self.structured_outputs_worker is not None
+                self.structured_outputs_worker.apply_grammar_bitmask(
+                    logits,
+                    input_batch,
+                    grammar_output.structured_output_request_ids,
+                    grammar_output.grammar_bitmask,
+                )
+
+            if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
+                assert self.sampler is not None
+                sampler_output = self.sampler(logits, input_batch)
+            else:
+                # Rejection sampling for spec decoding.
+                assert self.rejection_sampler is not None
+                assert self.speculator is not None
+                sampler_output = self.rejection_sampler(
+                    logits,
+                    input_batch,
+                    # Draft logits are needed for probabilistic rejection sampling.
+                    self.speculator.draft_logits,
+                )
+
+            return (
+                sampler_output,
+                sampler_output.num_sampled,
+                sampler_output.num_rejected,
             )
 
-        if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
-            assert self.sampler is not None
-            sampler_output = self.sampler(logits, input_batch)
-        else:
-            # Rejection sampling for spec decoding.
-            assert self.rejection_sampler is not None
-            assert self.speculator is not None
-            sampler_output = self.rejection_sampler(
-                logits,
-                input_batch,
-                # Draft logits are needed for probabilistic rejection sampling.
-                self.speculator.draft_logits,
-            )
+        consumer_sources: dict[str, str] = {}
+        contract_metadata: dict[str, str | bool] = {}
+        trace_enabled = _CONSUMER_STATE_TRACE_ENABLED
+        component = type(self.model).__name__
+        with trace_output_phase_peak(
+            component,
+            consumer_sources=consumer_sources,
+            contract_metadata=contract_metadata,
+            variant=validation_variant,
+        ):
+            if (
+                validation_variant != "off"
+                and self.sampler is not None
+                and grammar_output is None
+                and self.rejection_sampler is None
+            ):
+                sample_from_hidden_states = getattr(
+                    self.sampler, "sample_from_hidden_states", None
+                )
+                if not callable(sample_from_hidden_states):
+                    raise RuntimeError(
+                        "Explicit DiffusionGemma validation requires callable "
+                        "sampler.sample_from_hidden_states(); benchmark run is invalid"
+                    )
+                sampler_output = sample_from_hidden_states(
+                    sample_hidden_states, input_batch, self.model
+                )
+                if sampler_output is not None:
+                    sources, metadata = require_consumer_state_attribution(
+                        self.sampler,
+                        "validation_consumer_spec",
+                        expected_variant=validation_variant,
+                    )
+                    consumer_sources.update(sources)
+                    contract_metadata.update(metadata)
+                    return (
+                        sampler_output,
+                        sampler_output.num_sampled,
+                        sampler_output.num_rejected,
+                    )
 
-        return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
+            local_vocab_logits_context = nullcontext()
+            if grammar_output is None and self.rejection_sampler is None:
+                enable_local_vocab_logits = getattr(
+                    self.model, "enable_local_vocab_logits", None
+                )
+                if enable_local_vocab_logits is not None:
+                    local_vocab_logits_context = enable_local_vocab_logits()
+            with local_vocab_logits_context:
+                logits = self.model.compute_logits(sample_hidden_states)
+            if grammar_output is not None:
+                # Apply grammar bitmask to the logits in-place.
+                assert self.structured_outputs_worker is not None
+                self.structured_outputs_worker.apply_grammar_bitmask(
+                    logits,
+                    input_batch,
+                    grammar_output.structured_output_request_ids,
+                    grammar_output.grammar_bitmask,
+                )
+
+            if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
+                assert self.sampler is not None
+                sampler_output = self.sampler(logits, input_batch)
+            else:
+                # Rejection sampling for spec decoding.
+                assert self.rejection_sampler is not None
+                assert self.speculator is not None
+                sampler_output = self.rejection_sampler(
+                    logits,
+                    input_batch,
+                    # Draft logits are needed for probabilistic rejection sampling.
+                    self.speculator.draft_logits,
+                )
+
+            if trace_enabled or validation_variant != "off":
+                sources, metadata = require_consumer_state_attribution(
+                    self.sampler,
+                    "trace_consumer_spec_for_logits",
+                    logits,
+                    input_batch,
+                )
+                consumer_sources.update(sources)
+                contract_metadata.update(metadata)
+            return (
+                sampler_output,
+                sampler_output.num_sampled,
+                sampler_output.num_rejected,
+            )
 
     def postprocess_sampled(
         self,

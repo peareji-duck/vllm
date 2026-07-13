@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
@@ -73,6 +74,132 @@ from .interfaces import (
 logger = init_logger(__name__)
 
 _DIFFUSION_GEMMA_LOCAL_VOCAB_SAMPLER = envs.VLLM_DIFFUSION_GEMMA_LOCAL_VOCAB_SAMPLER
+_DIFFUSION_GEMMA_VALIDATION_VARIANT = envs.VLLM_DIFFUSION_GEMMA_VALIDATION_VARIANT
+
+
+@dataclass(frozen=True)
+class ValidationVariantSpec:
+    """Executed consumer sources and paper-evaluation role for one path.
+
+    ``reference`` identifies full Consumer-State, while
+    ``dominator_candidate`` is reserved for the token-microbatch control that
+    may dominate it. Dense is baseline context and partial variants are
+    ablations only.
+    """
+
+    effective_variant: str
+    pareto_role: str
+    sample: str
+    clean_argmax: str
+    entropy_remask: str
+    soft_self_conditioning: str
+    consumer_contract: str = "vllm_diffusiongemma"
+
+    @property
+    def pareto_gate_eligible(self) -> bool:
+        return self.pareto_role == "dominator_candidate"
+
+    def as_source_tags(self) -> dict[str, str]:
+        return {
+            "sample": self.sample,
+            "clean_argmax": self.clean_argmax,
+            "entropy_remask": self.entropy_remask,
+            "soft_self_conditioning": self.soft_self_conditioning,
+        }
+
+    def as_contract_metadata(self) -> dict[str, str | bool]:
+        return {
+            "effective_variant": self.effective_variant,
+            "consumer_contract": self.consumer_contract,
+            "pareto_role": self.pareto_role,
+            "pareto_gate_eligible": self.pareto_gate_eligible,
+        }
+
+
+def get_validation_variant() -> str:
+    variant = envs.VLLM_DIFFUSION_GEMMA_VALIDATION_VARIANT
+    assert variant is not None
+    return variant
+
+
+def get_token_microbatch_rows() -> int:
+    return envs.VLLM_DIFFUSION_GEMMA_TOKEN_MICROBATCH_ROWS
+
+
+def validation_variant_spec(variant: str) -> ValidationVariantSpec:
+    specs = {
+        "off": ValidationVariantSpec(
+            effective_variant="off",
+            pareto_role="baseline_context",
+            sample="dense_logits",
+            clean_argmax="dense_logits",
+            entropy_remask="dense_logits",
+            soft_self_conditioning="dense_logits",
+        ),
+        "token_axis_logit_microbatch": ValidationVariantSpec(
+            effective_variant="token_axis_logit_microbatch",
+            pareto_role="dominator_candidate",
+            sample="token_microbatch_dense_logits",
+            clean_argmax="token_microbatch_dense_logits",
+            entropy_remask="token_microbatch_dense_logits",
+            soft_self_conditioning="token_microbatch_dense_logits",
+        ),
+        "sample_only_dense_consumers": ValidationVariantSpec(
+            effective_variant="sample_only_dense_consumers",
+            pareto_role="ablation_only",
+            sample="local_state",
+            clean_argmax="dense_logits",
+            entropy_remask="dense_logits",
+            soft_self_conditioning="dense_logits",
+        ),
+        "sample_entropy_state_dense_soft_embed": ValidationVariantSpec(
+            effective_variant="sample_entropy_state_dense_soft_embed",
+            pareto_role="ablation_only",
+            sample="local_state",
+            clean_argmax="local_state",
+            entropy_remask="local_state",
+            soft_self_conditioning="dense_logits",
+        ),
+        "full_consumer_state": ValidationVariantSpec(
+            effective_variant="full_consumer_state",
+            pareto_role="reference",
+            sample="local_state",
+            clean_argmax="local_state",
+            entropy_remask="local_state",
+            soft_self_conditioning="local_state",
+        ),
+    }
+    try:
+        spec = specs[variant]
+    except KeyError as exc:
+        raise ValueError(
+            f"unknown DiffusionGemma validation variant: {variant!r}"
+        ) from exc
+    if not all(spec.as_source_tags().values()):
+        raise ValueError(f"untagged consumer source for validation variant {variant!r}")
+    return spec
+
+
+def validation_fallback_reason(
+    *,
+    chunk_rows: int,
+    requires_full_logprobs: bool,
+    has_grammar: bool,
+    has_rejection_sampler: bool,
+    expected_rows: int,
+    actual_rows: int,
+) -> str | None:
+    if chunk_rows <= 0:
+        return "nonpositive_chunk_rows"
+    if requires_full_logprobs:
+        return "full_logprobs"
+    if has_grammar:
+        return "grammar"
+    if has_rejection_sampler:
+        return "rejection_sampling"
+    if expected_rows != actual_rows:
+        return "malformed_rows"
+    return None
 
 
 class DiffusionGemmaSelfConditioning(nn.Module):
@@ -362,6 +489,13 @@ class DiffusionGemmaForConditionalGeneration(
         finally:
             self._allow_local_vocab_logits = previous
 
+    def compute_local_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return _compute_local_lm_head_logits(
+            self.lm_head,
+            hidden_states,
+            final_logit_softcapping=self.final_logit_softcapping,
+        )
+
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         if _DIFFUSION_GEMMA_LOCAL_VOCAB_SAMPLER and self._allow_local_vocab_logits:
             logits = _compute_local_lm_head_logits(
@@ -547,6 +681,72 @@ def _local_vocab_softmax_stats(
         all_reduce_sum_fn(soft_embeds) if all_reduce_sum_fn is not None else soft_embeds
     )
     return entropy, soft_embeds.to(embed_weight.dtype) * normalizer
+
+
+def _local_vocab_entropy(
+    scaled_logits: torch.Tensor,
+    *,
+    local_vocab_width: int,
+    global_max: torch.Tensor,
+    all_reduce_sum_fn: Callable[[torch.Tensor], torch.Tensor],
+) -> torch.Tensor:
+    logits_f = scaled_logits[..., :local_vocab_width].float()
+    global_max = global_max.float()
+    local_exp = torch.exp(logits_f - global_max.unsqueeze(-1))
+    stats = torch.stack(
+        [
+            local_exp.sum(dim=-1),
+            (local_exp * logits_f).sum(dim=-1),
+        ],
+        dim=-1,
+    )
+    stats = all_reduce_sum_fn(stats)
+    global_sum_exp = stats[..., 0]
+    log_z = torch.log(global_sum_exp) + global_max
+    return log_z - stats[..., 1] / global_sum_exp
+
+
+def _dense_soft_embed_from_full_scaled_logits(
+    full_scaled_logits: torch.Tensor,
+    embed_weight: torch.Tensor,
+    normalizer: torch.Tensor,
+    *,
+    sc_vocab_start: int,
+    sc_vocab_end: int,
+    tp_size: int,
+    all_reduce_sum_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+) -> torch.Tensor:
+    probs = full_scaled_logits.log_softmax(dim=-1).exp()
+    return _dense_soft_embed_from_probs(
+        probs,
+        embed_weight,
+        normalizer,
+        sc_vocab_start=sc_vocab_start,
+        sc_vocab_end=sc_vocab_end,
+        tp_size=tp_size,
+        all_reduce_sum_fn=all_reduce_sum_fn,
+    )
+
+
+def _dense_soft_embed_from_probs(
+    probs: torch.Tensor,
+    embed_weight: torch.Tensor,
+    normalizer: torch.Tensor,
+    *,
+    sc_vocab_start: int,
+    sc_vocab_end: int,
+    tp_size: int,
+    all_reduce_sum_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+) -> torch.Tensor:
+    local_probs = probs[..., sc_vocab_start:sc_vocab_end].to(embed_weight.dtype)
+    soft_embeds = torch.matmul(
+        local_probs, embed_weight[: sc_vocab_end - sc_vocab_start]
+    )
+    if tp_size > 1:
+        if all_reduce_sum_fn is None:
+            all_reduce_sum_fn = _tp_all_reduce_sum
+        soft_embeds = all_reduce_sum_fn(soft_embeds)
+    return soft_embeds * normalizer
 
 
 def _local_vocab_argmax_tokens(
@@ -994,7 +1194,14 @@ class DiffusionGemmaRequestStates:
             dtype=torch.int64,
             device=self.device,
         )
-        if _DIFFUSION_GEMMA_LOCAL_VOCAB_SAMPLER:
+        if (
+            _DIFFUSION_GEMMA_LOCAL_VOCAB_SAMPLER
+            or _DIFFUSION_GEMMA_VALIDATION_VARIANT
+            in {
+                "sample_only_dense_consumers",
+                "sample_entropy_state_dense_soft_embed",
+            }
+        ):
             self.canvas[slot_indices_np] = _tp_broadcast_from_rank0(
                 self.canvas[slot_indices_np]
             )
@@ -1647,6 +1854,605 @@ class DiffusionSampler:
 
         self.req_states.draft_tokens[all_slots, :CL] = states.canvas[all_slots]
         return scaled
+
+    def _compute_local_consumer_outputs(
+        self,
+        logits: torch.Tensor,
+        decode_slots: torch.Tensor,
+        *,
+        include_soft_embeds: bool,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+    ]:
+        states = self.diffusion_states
+        num_decode = decode_slots.shape[0]
+        device = decode_slots.device
+        CL = self.canvas_length
+
+        steps_f = states.step[decode_slots].float()
+        remaining = (states.max_denoising_steps - steps_f).clamp(min=1.0)
+        temp = self.t_min + (self.t_max - self.t_min) * (
+            remaining / states.max_denoising_steps
+        )
+
+        logits_3d = logits.reshape(num_decode, CL, -1).float()
+        scaled = logits_3d / temp[:, None, None].clamp(min=1e-10)
+        local_vocab_width = self.embed_vocab_end_index - self.embed_vocab_start_index
+
+        u = torch.rand(
+            scaled.shape,
+            device=device,
+            dtype=scaled.dtype,
+            generator=self._get_local_vocab_generator(device),
+        ).clamp(min=1e-20)
+        gumbel = -torch.log(-torch.log(u))
+        noisy = scaled + gumbel * (temp[:, None, None] > 0).float()
+        local_noisy_values, local_new_tokens = _local_vocab_argmax_tokens(
+            noisy,
+            vocab_start_index=self.embed_vocab_start_index,
+            local_vocab_width=local_vocab_width,
+        )
+        local_clean_values, local_argmax_tokens = _local_vocab_argmax_tokens(
+            scaled,
+            vocab_start_index=self.embed_vocab_start_index,
+            local_vocab_width=local_vocab_width,
+        )
+        argmax_values, argmax_indices = _tp_argmax_reduce_multi(
+            torch.stack([local_noisy_values, local_clean_values], dim=-1),
+            torch.stack([local_new_tokens, local_argmax_tokens], dim=-1),
+        )
+        new_tokens = argmax_indices[..., 0]
+        argmax_tokens = argmax_indices[..., 1]
+        global_clean_max = argmax_values[..., 1]
+
+        soft_embeds = None
+        if include_soft_embeds:
+            token_entropy, soft_embeds = _local_vocab_softmax_stats(
+                scaled,
+                self.embed_weight,
+                self.normalizer,
+                local_vocab_width=local_vocab_width,
+                global_max=global_clean_max,
+                all_reduce_sum_fn=_tp_all_reduce_sum,
+            )
+        else:
+            token_entropy = _local_vocab_entropy(
+                scaled,
+                local_vocab_width=local_vocab_width,
+                global_max=global_clean_max,
+                all_reduce_sum_fn=_tp_all_reduce_sum,
+            )
+        return scaled, new_tokens, argmax_tokens, token_entropy, soft_embeds
+
+    def _apply_denoise_step_outputs(
+        self,
+        *,
+        decode_slots: torch.Tensor,
+        decode_idx: torch.Tensor,
+        all_slots: torch.Tensor,
+        valid_canvas_len: torch.Tensor,
+        is_committing: torch.Tensor,
+        sampled: torch.Tensor,
+        num_sampled: torch.Tensor,
+        new_tokens: torch.Tensor,
+        argmax_tokens: torch.Tensor,
+        token_entropy: torch.Tensor,
+        soft_embeds: torch.Tensor,
+        consumer_sources: ValidationVariantSpec | None = None,
+        sync_canvas_from_rank0: bool = False,
+        random_tokens: torch.Tensor | None = None,
+    ) -> None:
+        if consumer_sources is not None and not all(
+            consumer_sources.as_source_tags().values()
+        ):
+            raise ValueError("validation path produced an untagged consumer output")
+
+        states = self.diffusion_states
+        num_decode = decode_slots.shape[0]
+        device = decode_slots.device
+        CL = self.canvas_length
+        ST = states.stability_threshold
+
+        sampled.zero_()
+        num_sampled.zero_()
+
+        mean_entropy = token_entropy.mean(dim=-1)
+        states.confident[decode_slots] = mean_entropy < self.confidence_threshold
+
+        sorted_ent, sorted_idx = torch.sort(token_entropy, dim=-1)
+        cumsum_ent = torch.cumsum(sorted_ent, dim=-1)
+        cummax_ent = torch.cummax(sorted_ent, dim=-1).values
+        sorted_mask = (cumsum_ent - cummax_ent) <= self.entropy_bound
+        eb_mask = torch.zeros_like(sorted_mask)
+        eb_mask.scatter_(1, sorted_idx, sorted_mask)
+
+        is_commit = is_committing
+        is_denoise = ~is_commit
+        cur_step = states.step[decode_slots].float()
+        new_step_val = torch.where(
+            is_denoise,
+            (cur_step + 1).to(states.step.dtype),
+            states.step.new_zeros(num_decode),
+        )
+        states.step[decode_slots] = new_step_val
+
+        if random_tokens is None:
+            random_tokens = torch.randint(
+                0,
+                self.vocab_size,
+                (num_decode, CL),
+                device=device,
+                dtype=states.canvas.dtype,
+            )
+        elif random_tokens.shape != (num_decode, CL):
+            raise ValueError(
+                "random-token validation input must have shape "
+                f"{(num_decode, CL)}, got {tuple(random_tokens.shape)}"
+            )
+        else:
+            random_tokens = random_tokens.to(
+                device=device,
+                dtype=states.canvas.dtype,
+            )
+        random_tokens = _tp_broadcast_from_rank0(random_tokens)
+        denoise_canvas = torch.where(eb_mask, new_tokens, random_tokens)
+        states.canvas[decode_slots] = torch.where(
+            is_commit.unsqueeze(1), random_tokens, denoise_canvas
+        )
+
+        hist_len = states.accepted_canvas_history_len[decode_slots]
+        write_pos = hist_len % ST
+        for i in range(ST):
+            write_here = ((write_pos == i) & is_denoise).unsqueeze(1)
+            states.accepted_canvas_history[decode_slots, i] = torch.where(
+                write_here,
+                argmax_tokens,
+                states.accepted_canvas_history[decode_slots, i],
+            )
+
+        states.argmax_canvas[decode_slots] = torch.where(
+            is_denoise.unsqueeze(1), argmax_tokens, states.argmax_canvas[decode_slots]
+        )
+
+        new_hist_len = torch.where(
+            is_denoise, hist_len + 1, hist_len.new_zeros(num_decode)
+        )
+        states.accepted_canvas_history_len[decode_slots] = new_hist_len
+
+        sampled[decode_idx] = states.argmax_canvas[decode_slots].to(
+            sampled.dtype
+        ) * is_commit.unsqueeze(1).to(sampled.dtype)
+        num_sampled[decode_idx] = is_commit.to(num_sampled.dtype) * valid_canvas_len.to(
+            num_sampled.dtype
+        )
+
+        ref = states.accepted_canvas_history[decode_slots, 0]
+        mismatch = torch.zeros(num_decode, device=device, dtype=torch.int32)
+        for h in range(1, ST):
+            mismatch = (
+                mismatch
+                + (ref != states.accepted_canvas_history[decode_slots, h])
+                .sum(dim=-1)
+                .int()
+            )
+        stable = mismatch == 0
+
+        step_after = states.step[decode_slots]
+        converged = (stable & states.confident[decode_slots] & (new_hist_len >= ST)) | (
+            step_after >= states.max_denoising_steps
+        )
+        states.is_encoder_phase[decode_slots] = torch.where(
+            is_commit, is_commit.new_zeros(num_decode), converged
+        )
+
+        sc_keep = (is_denoise & ~states.is_encoder_phase[decode_slots])[:, None, None]
+        states.self_conditioning_embeds[decode_slots] = (soft_embeds * sc_keep).to(
+            states.self_conditioning_embeds.dtype
+        )
+
+        newly_converged = (converged & is_denoise).unsqueeze(1)
+        states.canvas[decode_slots] = torch.where(
+            newly_converged,
+            states.argmax_canvas[decode_slots],
+            states.canvas[decode_slots],
+        )
+
+        if sync_canvas_from_rank0 and self.tp_size > 1:
+            states.canvas[decode_slots] = _tp_broadcast_from_rank0(
+                states.canvas[decode_slots]
+            )
+
+        self.req_states.draft_tokens[all_slots, :CL] = states.canvas[all_slots]
+
+    def validation_consumer_spec(self) -> ValidationVariantSpec:
+        return validation_variant_spec(get_validation_variant())
+
+    def trace_consumer_spec_for_logits(
+        self, logits: torch.Tensor | None, input_batch: Any
+    ) -> ValidationVariantSpec:
+        """Describe the path this call will take without retaining request state."""
+        num_reqs = input_batch.num_reqs
+        per_req_nlogits_np = np.diff(input_batch.cu_num_logits_np[: num_reqs + 1])
+        num_decode = int(np.count_nonzero(per_req_nlogits_np > 0))
+        use_local_vocab = _should_use_local_vocab_sampler(
+            logits, num_decode, vocab_size=self.vocab_size
+        )
+        if use_local_vocab:
+            slots_np = input_batch.idx_mapping_np[:num_reqs]
+            max_num_logprobs = self.sampling_states.max_num_logprobs(slots_np)
+            use_local_vocab = not _local_vocab_requires_full_logprobs(
+                max_num_logprobs,
+                req_ids=getattr(input_batch, "req_ids", [])[:num_reqs],
+            )
+        return validation_variant_spec(
+            "full_consumer_state" if use_local_vocab else "off"
+        )
+
+    def _sample_token_axis_logit_microbatch(
+        self,
+        hidden_states: torch.Tensor,
+        model: Any,
+        *,
+        decode_slots: torch.Tensor,
+        decode_idx: torch.Tensor,
+        all_slots: torch.Tensor,
+        valid_canvas_len: torch.Tensor,
+        is_committing: torch.Tensor,
+        sampled: torch.Tensor,
+        num_sampled: torch.Tensor,
+        gumbel_for_rows: Callable[[int, int], torch.Tensor] | None = None,
+        random_tokens: torch.Tensor | None = None,
+    ) -> None:
+        """Run the full output-head contract in bounded token-row chunks.
+
+        CUDA random kernels assign Philox subsequences per launch, so bounded
+        ``rand_like`` calls and the subsequent RNG state are distributionally
+        equivalent but not bitwise identical to one full-shape call under the
+        same seed. The optional RNG inputs are only a validation seam for exact
+        fixed-randomness tests; the benchmark path keeps PyTorch's normal RNG
+        and never allocates a full ``[rows, vocab]`` random tensor.
+        """
+        states = self.diffusion_states
+        rows = hidden_states.shape[0]
+        chunk_rows = get_token_microbatch_rows()
+        CL = self.canvas_length
+        num_decode = decode_slots.shape[0]
+        steps_f = states.step[decode_slots].float()
+        remaining = (states.max_denoising_steps - steps_f).clamp(min=1.0)
+        temp = self.t_min + (self.t_max - self.t_min) * (
+            remaining / states.max_denoising_steps
+        )
+        row_temp = temp.repeat_interleave(CL)
+
+        clean_tokens = torch.empty(rows, dtype=torch.int64, device=hidden_states.device)
+        sample_tokens = torch.empty_like(clean_tokens)
+        entropy = torch.empty(rows, dtype=torch.float32, device=hidden_states.device)
+        soft_embeds = torch.empty(
+            rows,
+            self.embed_weight.shape[1],
+            dtype=self.embed_weight.dtype,
+            device=hidden_states.device,
+        )
+
+        for start in range(0, rows, chunk_rows):
+            stop = min(start + chunk_rows, rows)
+            logits = model.compute_logits(hidden_states[start:stop])
+            if (
+                logits is None
+                or logits.ndim != 2
+                or logits.shape[-1] != self.vocab_size
+            ):
+                raise RuntimeError(
+                    "token-axis validation requires regular full-vocabulary "
+                    "model.compute_logits output"
+                )
+            scaled = logits.float() / row_temp[start:stop, None].clamp(min=1e-10)
+            if gumbel_for_rows is None:
+                u = torch.rand_like(scaled).clamp(min=1e-20)
+                gumbel = -torch.log(-torch.log(u))
+            else:
+                gumbel = gumbel_for_rows(start, stop)
+                if gumbel.shape != scaled.shape:
+                    raise ValueError(
+                        "fixed Gumbel validation input must match chunk logits: "
+                        f"expected {tuple(scaled.shape)}, got {tuple(gumbel.shape)}"
+                    )
+                gumbel = gumbel.to(device=scaled.device, dtype=scaled.dtype)
+            noisy = scaled + gumbel * (row_temp[start:stop, None] > 0).float()
+            log_probs = scaled.log_softmax(dim=-1)
+            probs = log_probs.exp()
+
+            clean_tokens[start:stop] = scaled.argmax(dim=-1)
+            sample_tokens[start:stop] = noisy.argmax(dim=-1)
+            entropy[start:stop] = -(probs * log_probs).sum(dim=-1)
+            soft_embeds[start:stop] = _dense_soft_embed_from_probs(
+                probs,
+                self.embed_weight,
+                self.normalizer,
+                sc_vocab_start=self.sc_vocab_start,
+                sc_vocab_end=self.sc_vocab_end,
+                tp_size=self.tp_size,
+            )
+
+        sources = validation_variant_spec("token_axis_logit_microbatch")
+        self._apply_denoise_step_outputs(
+            decode_slots=decode_slots,
+            decode_idx=decode_idx,
+            all_slots=all_slots,
+            valid_canvas_len=valid_canvas_len,
+            is_committing=is_committing,
+            sampled=sampled,
+            num_sampled=num_sampled,
+            new_tokens=sample_tokens.reshape(num_decode, CL),
+            argmax_tokens=clean_tokens.reshape(num_decode, CL),
+            token_entropy=entropy.reshape(num_decode, CL),
+            soft_embeds=soft_embeds.reshape(num_decode, CL, -1),
+            consumer_sources=sources,
+            sync_canvas_from_rank0=True,
+            random_tokens=random_tokens,
+        )
+
+    def _sample_only_dense_consumers(
+        self,
+        hidden_states: torch.Tensor,
+        model: Any,
+        *,
+        decode_slots: torch.Tensor,
+        decode_idx: torch.Tensor,
+        all_slots: torch.Tensor,
+        valid_canvas_len: torch.Tensor,
+        is_committing: torch.Tensor,
+        sampled: torch.Tensor,
+        num_sampled: torch.Tensor,
+        gumbel: torch.Tensor | None = None,
+        random_tokens: torch.Tensor | None = None,
+    ) -> None:
+        """Keep only Gumbel sampling local; gather every other consumer."""
+        states = self.diffusion_states
+        num_decode = decode_slots.shape[0]
+        device = decode_slots.device
+        CL = self.canvas_length
+        steps_f = states.step[decode_slots].float()
+        remaining = (states.max_denoising_steps - steps_f).clamp(min=1.0)
+        temp = self.t_min + (self.t_max - self.t_min) * (
+            remaining / states.max_denoising_steps
+        )
+
+        local_logits = model.compute_local_logits(hidden_states)
+        scaled = local_logits.reshape(num_decode, CL, -1).float()
+        scaled = scaled / temp[:, None, None].clamp(min=1e-10)
+        local_vocab_width = self.embed_vocab_end_index - self.embed_vocab_start_index
+
+        if gumbel is None:
+            u = torch.rand(
+                scaled.shape,
+                device=device,
+                dtype=scaled.dtype,
+                generator=self._get_local_vocab_generator(device),
+            ).clamp(min=1e-20)
+            gumbel = -torch.log(-torch.log(u))
+        elif gumbel.shape != scaled.shape:
+            raise ValueError(
+                "fixed Gumbel validation input must match local logits: "
+                f"expected {tuple(scaled.shape)}, got {tuple(gumbel.shape)}"
+            )
+        else:
+            gumbel = gumbel.to(device=device, dtype=scaled.dtype)
+
+        noisy = scaled + gumbel * (temp[:, None, None] > 0).float()
+        local_noisy_values, local_new_tokens = _local_vocab_argmax_tokens(
+            noisy,
+            vocab_start_index=self.embed_vocab_start_index,
+            local_vocab_width=local_vocab_width,
+        )
+        _, global_new_tokens = _tp_argmax_reduce_multi(
+            local_noisy_values.unsqueeze(-1),
+            local_new_tokens.unsqueeze(-1),
+        )
+        new_tokens = global_new_tokens[..., 0]
+
+        full_scaled_logits = _tp_all_gather_vocab(scaled)[..., : self.vocab_size]
+        log_probs = full_scaled_logits.log_softmax(dim=-1)
+        probs = log_probs.exp()
+        argmax_tokens = full_scaled_logits.argmax(dim=-1)
+        token_entropy = -(probs * log_probs).sum(dim=-1)
+        soft_embeds = _dense_soft_embed_from_probs(
+            probs,
+            self.embed_weight,
+            self.normalizer,
+            sc_vocab_start=self.sc_vocab_start,
+            sc_vocab_end=self.sc_vocab_end,
+            tp_size=self.tp_size,
+        )
+
+        self._apply_denoise_step_outputs(
+            decode_slots=decode_slots,
+            decode_idx=decode_idx,
+            all_slots=all_slots,
+            valid_canvas_len=valid_canvas_len,
+            is_committing=is_committing,
+            sampled=sampled,
+            num_sampled=num_sampled,
+            new_tokens=new_tokens,
+            argmax_tokens=argmax_tokens,
+            token_entropy=token_entropy,
+            soft_embeds=soft_embeds,
+            consumer_sources=validation_variant_spec("sample_only_dense_consumers"),
+            random_tokens=random_tokens,
+        )
+
+    def _sample_entropy_state_dense_soft_embed(
+        self,
+        hidden_states: torch.Tensor,
+        model: Any,
+        *,
+        decode_slots: torch.Tensor,
+        decode_idx: torch.Tensor,
+        all_slots: torch.Tensor,
+        valid_canvas_len: torch.Tensor,
+        is_committing: torch.Tensor,
+        sampled: torch.Tensor,
+        num_sampled: torch.Tensor,
+    ) -> None:
+        local_logits = model.compute_local_logits(hidden_states)
+        scaled, new_tokens, argmax_tokens, token_entropy, _ = (
+            self._compute_local_consumer_outputs(
+                local_logits,
+                decode_slots,
+                include_soft_embeds=False,
+            )
+        )
+        full_scaled_logits = _tp_all_gather_vocab(scaled)[..., : self.vocab_size]
+        soft_embeds = _dense_soft_embed_from_full_scaled_logits(
+            full_scaled_logits,
+            self.embed_weight,
+            self.normalizer,
+            sc_vocab_start=self.sc_vocab_start,
+            sc_vocab_end=self.sc_vocab_end,
+            tp_size=self.tp_size,
+        )
+        sources = validation_variant_spec("sample_entropy_state_dense_soft_embed")
+        if sources.soft_self_conditioning != "dense_logits":
+            raise ValueError(
+                "intermediate validation soft consumer is not dense-tagged"
+            )
+        self._apply_denoise_step_outputs(
+            decode_slots=decode_slots,
+            decode_idx=decode_idx,
+            all_slots=all_slots,
+            valid_canvas_len=valid_canvas_len,
+            is_committing=is_committing,
+            sampled=sampled,
+            num_sampled=num_sampled,
+            new_tokens=new_tokens,
+            argmax_tokens=argmax_tokens,
+            token_entropy=token_entropy,
+            soft_embeds=soft_embeds,
+            consumer_sources=sources,
+        )
+
+    def sample_from_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        input_batch: Any,
+        model: Any,
+    ) -> SamplerOutput | None:
+        variant = get_validation_variant()
+        if variant == "off" or input_batch.num_draft_tokens == 0:
+            return None
+
+        num_reqs = input_batch.num_reqs
+        CL = self.canvas_length
+        slots_np = input_batch.idx_mapping_np[:num_reqs]
+        per_req_nlogits_np = np.diff(input_batch.cu_num_logits_np[: num_reqs + 1])
+        decode_indices_np = np.where(per_req_nlogits_np > 0)[0]
+        num_decode = len(decode_indices_np)
+        if num_decode == 0:
+            return None
+
+        max_num_logprobs = self.sampling_states.max_num_logprobs(slots_np)
+        requires_full_logprobs = _local_vocab_requires_full_logprobs(
+            max_num_logprobs,
+            req_ids=getattr(input_batch, "req_ids", [])[:num_reqs],
+        )
+        expected_rows = num_decode * CL
+        actual_rows = hidden_states.shape[0]
+        if np.any(per_req_nlogits_np[decode_indices_np] != CL):
+            actual_rows = -1
+        chunk_rows = (
+            get_token_microbatch_rows()
+            if variant == "token_axis_logit_microbatch"
+            else 1
+        )
+        fallback_reason = validation_fallback_reason(
+            chunk_rows=chunk_rows,
+            requires_full_logprobs=requires_full_logprobs,
+            has_grammar=False,
+            has_rejection_sampler=False,
+            expected_rows=expected_rows,
+            actual_rows=actual_rows,
+        )
+        if fallback_reason is not None:
+            logger.warning_once(
+                "DiffusionGemma validation variant %s falling back to dense: %s",
+                variant,
+                fallback_reason,
+            )
+            return None
+
+        prefill_indices_np = np.where(per_req_nlogits_np == 0)[0]
+        if len(prefill_indices_np) > 0:
+            self._finish_prefills(input_batch, prefill_indices_np)
+
+        decode_slots_np = slots_np[decode_indices_np]
+        self._decode_slots.np[:num_decode] = decode_slots_np
+        self._decode_idx.np[:num_decode] = decode_indices_np
+        self._decode_slots.copy_to_uva()
+        self._decode_idx.copy_to_uva()
+        decode_slots = self._decode_slots.gpu[:num_decode]
+        decode_idx = self._decode_idx.gpu[:num_decode]
+        valid_canvas_len = async_copy_to_gpu(
+            per_req_nlogits_np[decode_indices_np].astype(np.int64),
+            device=hidden_states.device,
+        )
+        sampled = self._sampled[:num_reqs]
+        num_sampled = self._num_sampled[:num_reqs]
+        all_slots = input_batch.idx_mapping[:num_reqs]
+        is_committing = self.diffusion_states.is_encoder_phase[decode_slots].clone()
+
+        if variant == "token_axis_logit_microbatch":
+            self._sample_token_axis_logit_microbatch(
+                hidden_states,
+                model,
+                decode_slots=decode_slots,
+                decode_idx=decode_idx,
+                all_slots=all_slots,
+                valid_canvas_len=valid_canvas_len,
+                is_committing=is_committing,
+                sampled=sampled,
+                num_sampled=num_sampled,
+            )
+        elif variant == "sample_only_dense_consumers":
+            self._sample_only_dense_consumers(
+                hidden_states,
+                model,
+                decode_slots=decode_slots,
+                decode_idx=decode_idx,
+                all_slots=all_slots,
+                valid_canvas_len=valid_canvas_len,
+                is_committing=is_committing,
+                sampled=sampled,
+                num_sampled=num_sampled,
+            )
+        elif variant == "sample_entropy_state_dense_soft_embed":
+            self._sample_entropy_state_dense_soft_embed(
+                hidden_states,
+                model,
+                decode_slots=decode_slots,
+                decode_idx=decode_idx,
+                all_slots=all_slots,
+                valid_canvas_len=valid_canvas_len,
+                is_committing=is_committing,
+                sampled=sampled,
+                num_sampled=num_sampled,
+            )
+        else:
+            raise ValueError(
+                f"unsupported DiffusionGemma validation variant: {variant}"
+            )
+
+        return self._build_output(
+            input_batch,
+            sampled,
+            num_sampled,
+            per_req_nlogits_np,
+            hidden_states.device,
+            logprobs_tensors=None,
+        )
 
     # ------------------------------------------------------------------
     # Main entry point
