@@ -126,6 +126,9 @@ def get_token_microbatch_rows() -> int:
     return envs.VLLM_DIFFUSION_GEMMA_TOKEN_MICROBATCH_ROWS
 
 
+_DENSE_ABLATION_ROW_CHUNK_SIZE = 32
+
+
 def validation_variant_spec(variant: str) -> ValidationVariantSpec:
     specs = {
         "off": ValidationVariantSpec(
@@ -747,6 +750,64 @@ def _dense_soft_embed_from_probs(
             all_reduce_sum_fn = _tp_all_reduce_sum
         soft_embeds = all_reduce_sum_fn(soft_embeds)
     return soft_embeds * normalizer
+
+
+def _dense_consumer_probability_chunk(scaled_logits: torch.Tensor) -> torch.Tensor:
+    return scaled_logits.softmax(dim=-1)
+
+
+def _bounded_dense_consumer_outputs(
+    full_scaled_logits: torch.Tensor,
+    embed_weight: torch.Tensor,
+    normalizer: torch.Tensor,
+    *,
+    sc_vocab_start: int,
+    sc_vocab_end: int,
+    tp_size: int,
+    row_chunk_size: int,
+    include_entropy: bool,
+    all_reduce_sum_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+) -> tuple[torch.Tensor | None, torch.Tensor]:
+    """Evaluate dense ablation consumers without another full-vocab tensor."""
+    if row_chunk_size <= 0:
+        raise ValueError("dense ablation row chunk size must be positive")
+
+    leading_shape = full_scaled_logits.shape[:-1]
+    flat_logits = full_scaled_logits.view(-1, full_scaled_logits.shape[-1])
+    rows = flat_logits.shape[0]
+    entropy = (
+        torch.empty(rows, dtype=torch.float32, device=flat_logits.device)
+        if include_entropy
+        else None
+    )
+    local_weight = embed_weight[: sc_vocab_end - sc_vocab_start]
+    local_soft_embeds = torch.empty(
+        rows,
+        embed_weight.shape[1],
+        dtype=embed_weight.dtype,
+        device=flat_logits.device,
+    )
+
+    for start in range(0, rows, row_chunk_size):
+        stop = min(start + row_chunk_size, rows)
+        logits = flat_logits[start:stop]
+        log_z = torch.logsumexp(logits, dim=-1) if include_entropy else None
+        probs = _dense_consumer_probability_chunk(logits)
+        local_probs = probs[:, sc_vocab_start:sc_vocab_end].to(embed_weight.dtype)
+        local_soft_embeds[start:stop] = torch.matmul(local_probs, local_weight)
+        if entropy is not None:
+            assert log_z is not None
+            entropy[start:stop] = log_z - probs.mul_(logits).sum(dim=-1)
+
+    soft_embeds = local_soft_embeds.view(*leading_shape, embed_weight.shape[1])
+    if tp_size > 1:
+        if all_reduce_sum_fn is None:
+            all_reduce_sum_fn = _tp_all_reduce_sum
+        soft_embeds = all_reduce_sum_fn(soft_embeds)
+    soft_embeds.mul_(normalizer)
+    if entropy is not None:
+        entropy = entropy.view(*leading_shape)
+    return entropy, soft_embeds
 
 
 def _local_vocab_argmax_tokens(
@@ -2310,6 +2371,7 @@ class DiffusionSampler:
                 generator=self._get_local_vocab_generator(device),
             ).clamp(min=1e-20)
             gumbel = -torch.log(-torch.log(u))
+            del u
         elif gumbel.shape != scaled.shape:
             raise ValueError(
                 "fixed Gumbel validation input must match local logits: "
@@ -2329,20 +2391,22 @@ class DiffusionSampler:
             local_new_tokens.unsqueeze(-1),
         )
         new_tokens = global_new_tokens[..., 0]
+        del gumbel, noisy, local_noisy_values, local_new_tokens, global_new_tokens
 
         full_scaled_logits = _tp_all_gather_vocab(scaled)[..., : self.vocab_size]
-        log_probs = full_scaled_logits.log_softmax(dim=-1)
-        probs = log_probs.exp()
+        del local_logits, scaled
         argmax_tokens = full_scaled_logits.argmax(dim=-1)
-        token_entropy = -(probs * log_probs).sum(dim=-1)
-        soft_embeds = _dense_soft_embed_from_probs(
-            probs,
+        token_entropy, soft_embeds = _bounded_dense_consumer_outputs(
+            full_scaled_logits,
             self.embed_weight,
             self.normalizer,
             sc_vocab_start=self.sc_vocab_start,
             sc_vocab_end=self.sc_vocab_end,
             tp_size=self.tp_size,
+            row_chunk_size=_DENSE_ABLATION_ROW_CHUNK_SIZE,
+            include_entropy=True,
         )
+        assert token_entropy is not None
 
         self._apply_denoise_step_outputs(
             decode_slots=decode_slots,
@@ -2382,13 +2446,16 @@ class DiffusionSampler:
             )
         )
         full_scaled_logits = _tp_all_gather_vocab(scaled)[..., : self.vocab_size]
-        soft_embeds = _dense_soft_embed_from_full_scaled_logits(
+        del local_logits, scaled
+        _, soft_embeds = _bounded_dense_consumer_outputs(
             full_scaled_logits,
             self.embed_weight,
             self.normalizer,
             sc_vocab_start=self.sc_vocab_start,
             sc_vocab_end=self.sc_vocab_end,
             tp_size=self.tp_size,
+            row_chunk_size=_DENSE_ABLATION_ROW_CHUNK_SIZE,
+            include_entropy=False,
         )
         sources = validation_variant_spec("sample_entropy_state_dense_soft_embed")
         if sources.soft_self_conditioning != "dense_logits":

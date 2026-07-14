@@ -149,6 +149,66 @@ def test_token_microbatch_matches_dense_fixed_gumbel():
     )
 
 
+@pytest.mark.parametrize("include_entropy", [False, True])
+def test_dense_ablation_consumers_bound_probability_rows_and_reduce_once(
+    monkeypatch: pytest.MonkeyPatch, include_entropy: bool
+):
+    generator = torch.Generator(device="cpu").manual_seed(17)
+    full_scaled = torch.randn(3, 4, 17, generator=generator)
+    embed_weight = torch.randn(17, 7, generator=generator)
+    normalizer = torch.tensor(1.25)
+    probability_shapes: list[tuple[int, ...]] = []
+    reduce_shapes: list[tuple[int, ...]] = []
+    original_probability_chunk = diffusion_gemma._dense_consumer_probability_chunk
+
+    def tracked_probability_chunk(logits: torch.Tensor) -> torch.Tensor:
+        probability_shapes.append(tuple(logits.shape))
+        return original_probability_chunk(logits)
+
+    def tracked_all_reduce(value: torch.Tensor) -> torch.Tensor:
+        reduce_shapes.append(tuple(value.shape))
+        return value
+
+    monkeypatch.setattr(
+        diffusion_gemma,
+        "_dense_consumer_probability_chunk",
+        tracked_probability_chunk,
+    )
+
+    entropy, soft_embeds = diffusion_gemma._bounded_dense_consumer_outputs(
+        full_scaled,
+        embed_weight,
+        normalizer,
+        sc_vocab_start=0,
+        sc_vocab_end=17,
+        tp_size=2,
+        row_chunk_size=2,
+        include_entropy=include_entropy,
+        all_reduce_sum_fn=tracked_all_reduce,
+    )
+
+    log_probs = full_scaled.log_softmax(dim=-1)
+    probs = log_probs.exp()
+    assert probability_shapes == [(2, 17)] * 6
+    assert reduce_shapes == [(3, 4, 7)]
+    torch.testing.assert_close(
+        soft_embeds,
+        (probs @ embed_weight) * normalizer,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    if include_entropy:
+        assert entropy is not None
+        torch.testing.assert_close(
+            entropy,
+            -(probs * log_probs).sum(dim=-1),
+            rtol=1e-5,
+            atol=1e-6,
+        )
+    else:
+        assert entropy is None
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_token_microbatch_matches_dense_fixed_gumbel_cuda_bfloat16():
     torch.manual_seed(7)
