@@ -300,11 +300,94 @@ def test_token_microbatch_supported_inputs_do_not_fallback():
     )
 
 
+@pytest.mark.parametrize(
+    ("per_request_logits", "num_draft_tokens", "expected_phase"),
+    [
+        ([1, 1], 0, "prefill_only"),
+        ([3, 2], 5, "consumer_output_only"),
+        ([0, 3, 0, 2], 5, "mixed_prefill_consumer_output"),
+    ],
+)
+def test_diffusion_sampler_trace_batch_phase_classifies_logits_layout(
+    per_request_logits: list[int], num_draft_tokens: int, expected_phase: str
+):
+    sampler = DiffusionSampler.__new__(DiffusionSampler)
+    cumulative_logits = np.concatenate(
+        ([0], np.cumsum(per_request_logits, dtype=np.int64))
+    )
+    input_batch = SimpleNamespace(
+        num_reqs=len(per_request_logits),
+        num_draft_tokens=num_draft_tokens,
+        cu_num_logits_np=cumulative_logits,
+    )
+
+    assert sampler.trace_batch_phase(input_batch) == expected_phase
+
+
+def test_trace_batch_phase_groups_commit_and_denoise_as_consumer_output():
+    sampler = DiffusionSampler.__new__(DiffusionSampler)
+
+    class ForbiddenStateRead:
+        def __getattr__(self, name: str):
+            raise AssertionError(f"batch phase must not synchronize GPU state: {name}")
+
+    sampler.diffusion_states = ForbiddenStateRead()
+    input_batch = SimpleNamespace(
+        num_reqs=2,
+        num_draft_tokens=5,
+        cu_num_logits_np=np.array([0, 3, 5], dtype=np.int32),
+    )
+
+    # Positive-logit consumers include both denoise and commit steps. The
+    # structural trace category deliberately covers both without a GPU sync.
+    assert sampler.trace_batch_phase(input_batch) == "consumer_output_only"
+
+
+@pytest.mark.parametrize(
+    ("num_reqs", "num_draft_tokens", "cumulative_logits", "error"),
+    [
+        (0, 0, np.array([0], dtype=np.int32), "positive num_reqs"),
+        (1, 0, np.array([], dtype=np.int32), r"num_reqs \+ 1"),
+        (1, 0, np.array([[0, 1]], dtype=np.int32), "one-dimensional"),
+        (1, 0, np.array([1, 2], dtype=np.int32), "start at zero"),
+        (2, 1, np.array([0, 2, 1], dtype=np.int32), "negative"),
+        (2, 1, np.array([0, 127, -128], dtype=np.int8), "negative"),
+        (1, 0, np.array([0.0, 1.0]), "integer"),
+        (1, -1, np.array([0, 1], dtype=np.int32), "non-negative"),
+        (1, 0, np.array([0, 0], dtype=np.int32), "no-draft"),
+        (1, 0, np.array([0, 2], dtype=np.int32), "no-draft"),
+        (
+            1,
+            0,
+            np.array([0, 1, 99], dtype=np.int32),
+            r"exactly num_reqs \+ 1",
+        ),
+        (2, 1, np.array([0, 1, 2], dtype=np.int32), "must equal"),
+    ],
+)
+def test_diffusion_sampler_trace_batch_phase_rejects_invalid_logits_layout(
+    num_reqs: int,
+    num_draft_tokens: int,
+    cumulative_logits: np.ndarray,
+    error: str,
+):
+    sampler = DiffusionSampler.__new__(DiffusionSampler)
+    input_batch = SimpleNamespace(
+        num_reqs=num_reqs,
+        num_draft_tokens=num_draft_tokens,
+        cu_num_logits_np=cumulative_logits,
+    )
+
+    with pytest.raises(ValueError, match=error):
+        sampler.trace_batch_phase(input_batch)
+
+
 def test_memory_trace_record_emits_phase_delta():
     spec = validation_variant_spec("full_consumer_state")
     record = build_output_phase_peak_record(
         component="diffusion_gemma",
         variant="off",
+        batch_phase="mixed_prefill_consumer_output",
         global_rank=3,
         local_rank=1,
         tp_rank=1,
@@ -324,6 +407,8 @@ def test_memory_trace_record_emits_phase_delta():
         },
     )
 
+    assert record["schema_version"] == 4
+    assert record["batch_phase"] == "mixed_prefill_consumer_output"
     assert record["component"] == "diffusion_gemma"
     assert record["path"] == "output_phase_peak_hbm"
     assert record["peak_allocated_delta_bytes"] == 80
@@ -346,6 +431,7 @@ def test_memory_trace_does_not_treat_configured_variant_as_executed():
     record = build_output_phase_peak_record(
         component="diffusion_gemma",
         variant="sample_only_dense_consumers",
+        batch_phase="prefill_only",
         global_rank=0,
         local_rank=0,
         tp_rank=0,
@@ -363,6 +449,44 @@ def test_memory_trace_does_not_treat_configured_variant_as_executed():
     assert record["configured_variant"] == "sample_only_dense_consumers"
     assert record["variant"] == "unattributed"
     assert record["attribution_status"] == "missing"
+
+
+def test_memory_trace_record_rejects_missing_batch_phase():
+    with pytest.raises(RuntimeError, match="batch_phase"):
+        build_output_phase_peak_record(
+            component="diffusion_gemma",
+            variant="off",
+            global_rank=0,
+            local_rank=0,
+            tp_rank=0,
+            pid=1234,
+            cuda_device=0,
+            start_allocated=100,
+            start_reserved=120,
+            peak_allocated=180,
+            peak_reserved=240,
+            component_elapsed_seconds=0.01,
+        )
+
+
+@pytest.mark.parametrize("batch_phase", ["", "prefill", "decode", 1])
+def test_memory_trace_record_rejects_invalid_batch_phase(batch_phase: object):
+    with pytest.raises(RuntimeError, match="batch_phase"):
+        build_output_phase_peak_record(
+            component="diffusion_gemma",
+            variant="off",
+            batch_phase=batch_phase,
+            global_rank=0,
+            local_rank=0,
+            tp_rank=0,
+            pid=1234,
+            cuda_device=0,
+            start_allocated=100,
+            start_reserved=120,
+            peak_allocated=180,
+            peak_reserved=240,
+            component_elapsed_seconds=0.01,
+        )
 
 
 @pytest.mark.parametrize(
@@ -397,6 +521,28 @@ def test_disabled_memory_trace_does_not_touch_cuda(
     monkeypatch.setattr(consumer_state_trace.time, "perf_counter", fail)
 
     with trace_output_phase_peak("diffusion_gemma"):
+        pass
+
+
+@pytest.mark.parametrize("batch_phase", [None, "decode"])
+def test_enabled_memory_trace_rejects_missing_or_invalid_batch_phase_before_cuda(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, batch_phase: str | None
+):
+    monkeypatch.setenv(
+        "VLLM_CONSUMER_STATE_PEAK_MEMORY_TRACE_JSONL", str(tmp_path / "peak.jsonl")
+    )
+
+    def fail(*args, **kwargs):
+        raise AssertionError("invalid batch_phase must fail before CUDA tracing")
+
+    monkeypatch.setattr(torch.cuda, "synchronize", fail)
+    with (
+        pytest.raises(RuntimeError, match="batch_phase"),
+        trace_output_phase_peak(
+            "diffusion_gemma",
+            batch_phase=batch_phase,
+        ),
+    ):
         pass
 
 
@@ -439,6 +585,7 @@ def test_enabled_memory_trace_writes_jsonl(monkeypatch: pytest.MonkeyPatch, tmp_
     contract_metadata: dict[str, object] = {}
     with trace_output_phase_peak(
         "diffusion_gemma",
+        batch_phase="consumer_output_only",
         consumer_sources=consumer_sources,
         contract_metadata=contract_metadata,
     ):
@@ -460,6 +607,8 @@ def test_enabled_memory_trace_writes_jsonl(monkeypatch: pytest.MonkeyPatch, tmp_
     rank_path = tmp_path / "peak.rank3.jsonl"
     assert not output_path.exists()
     record = json.loads(rank_path.read_text())
+    assert record["schema_version"] == 4
+    assert record["batch_phase"] == "consumer_output_only"
     assert record["component"] == "diffusion_gemma"
     assert record["peak_allocated_delta_bytes"] == 80
     assert record["consumer_sources"] == {
@@ -490,6 +639,7 @@ def test_enabled_memory_trace_records_actual_cuda_elapsed(tmp_path, monkeypatch)
 
     with trace_output_phase_peak(
         "diffusion_gemma",
+        batch_phase="consumer_output_only",
         consumer_sources=spec.as_source_tags(),
         contract_metadata=spec.as_contract_metadata(),
         variant="token_axis_logit_microbatch",
@@ -546,7 +696,9 @@ def test_trace_cleanup_failure_does_not_replace_body_exception(
 
     with (
         pytest.raises(ValueError, match="sampling failed"),
-        trace_output_phase_peak("diffusion_gemma"),
+        trace_output_phase_peak(
+            "diffusion_gemma", batch_phase="mixed_prefill_consumer_output"
+        ),
     ):
         raise ValueError("sampling failed")
 
@@ -595,7 +747,7 @@ def test_trace_cleanup_failure_propagates_after_successful_body(
     error = RuntimeError if failure_site == "final_sync" else OSError
     with (
         pytest.raises(error, match="trace .* failed"),
-        trace_output_phase_peak("diffusion_gemma"),
+        trace_output_phase_peak("diffusion_gemma", batch_phase="prefill_only"),
     ):
         pass
 
@@ -646,18 +798,30 @@ class _RunnerSampler:
     def validation_consumer_spec(self):
         return validation_variant_spec(get_validation_variant())
 
+    def trace_batch_phase(self, input_batch):
+        self.events.append("batch_phase")
+        return DiffusionSampler.trace_batch_phase(self, input_batch)
+
     def trace_consumer_spec_for_logits(self, logits, input_batch):
         return validation_variant_spec("off")
 
 
-def _runner_inputs(*, num_draft_tokens: int = 1) -> SimpleNamespace:
+def _runner_inputs(
+    *,
+    num_draft_tokens: int = 1,
+    per_request_logits: tuple[int, ...] = (1,),
+) -> SimpleNamespace:
+    cumulative_logits = np.concatenate(
+        ([0], np.cumsum(per_request_logits, dtype=np.int32))
+    )
+    total_logits = int(cumulative_logits[-1])
     return SimpleNamespace(
-        logits_indices=torch.tensor([0], dtype=torch.int64),
+        logits_indices=torch.arange(total_logits, dtype=torch.int64),
         num_draft_tokens=num_draft_tokens,
-        num_reqs=1,
-        idx_mapping_np=np.array([0]),
-        cu_num_logits_np=np.array([0, 1]),
-        req_ids=["request"],
+        num_reqs=len(per_request_logits),
+        idx_mapping_np=np.arange(len(per_request_logits)),
+        cu_num_logits_np=cumulative_logits,
+        req_ids=[f"request-{index}" for index in range(len(per_request_logits))],
     )
 
 
@@ -681,6 +845,7 @@ def test_model_runner_disabled_controls_use_base_path_without_probes(
 
     runner_sampler = _RunnerSampler(events, _sampler_output(7))
     runner_sampler.sample_from_hidden_states = fail
+    runner_sampler.trace_batch_phase = fail
     monkeypatch.setattr(model_runner, "trace_output_phase_peak", fail)
     runner = SimpleNamespace(
         model=_RunnerModel(events),
@@ -718,9 +883,15 @@ def test_model_runner_validation_result_bypasses_dense_logits(
     )
     events: list[str] = []
     expected = _sampler_output(7)
+    runner_sampler = _RunnerSampler(events, expected)
+
+    def fail(*args, **kwargs):
+        raise AssertionError("validation-only path must not classify trace phase")
+
+    runner_sampler.trace_batch_phase = fail
     runner = SimpleNamespace(
         model=_RunnerModel(events),
-        sampler=_RunnerSampler(events, expected),
+        sampler=runner_sampler,
         rejection_sampler=None,
     )
 
@@ -796,6 +967,9 @@ def test_model_runner_dense_path_requires_attribution_seam(
     events: list[str] = []
 
     class UnattributedDenseSampler:
+        def trace_batch_phase(self, input_batch) -> str:
+            return DiffusionSampler.trace_batch_phase(self, input_batch)
+
         def sample_from_hidden_states(self, *args) -> None:
             assert validation_falls_back
             events.append("validation_fallback")
@@ -844,6 +1018,9 @@ def test_model_runner_rejects_incomplete_consumer_attribution(
             return {"effective_variant": "off"}
 
     class IncompletelyAttributedSampler:
+        def trace_batch_phase(self, input_batch) -> str:
+            return DiffusionSampler.trace_batch_phase(self, input_batch)
+
         def __call__(self, *args) -> SamplerOutput:
             events.append("dense_sampler")
             return _sampler_output(9)
@@ -882,6 +1059,9 @@ def test_model_runner_body_exception_precedes_missing_attribution(
         pass
 
     class FailingSampler:
+        def trace_batch_phase(self, input_batch) -> str:
+            return DiffusionSampler.trace_batch_phase(self, input_batch)
+
         def sample_from_hidden_states(self, *args) -> SamplerOutput:
             raise BodyFailure("sampler body failed")
 
@@ -956,12 +1136,14 @@ def test_model_runner_trace_reports_executed_validation_contract(
     def capture_trace(
         component,
         *,
+        batch_phase,
         consumer_sources,
         contract_metadata,
         variant,
     ):
         yield
         captured["component"] = component
+        captured["batch_phase"] = batch_phase
         captured["sources"] = dict(consumer_sources)
         captured["metadata"] = dict(contract_metadata)
         captured["variant"] = variant
@@ -981,7 +1163,8 @@ def test_model_runner_trace_reports_executed_validation_contract(
         grammar_output=None,
     )
 
-    assert events == ["validation"]
+    assert events == ["batch_phase", "validation"]
+    assert captured["batch_phase"] == "consumer_output_only"
     assert captured["sources"] == expected_sources
     assert captured["metadata"] == {
         "effective_variant": variant,
@@ -990,6 +1173,163 @@ def test_model_runner_trace_reports_executed_validation_contract(
         "pareto_gate_eligible": pareto_gate_eligible,
     }
     assert captured["variant"] == variant
+
+
+def test_model_runner_trace_prefill_preserves_dense_attribution(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    variant = "token_axis_logit_microbatch"
+    monkeypatch.setenv("VLLM_DIFFUSION_GEMMA_VALIDATION_VARIANT", variant)
+    _set_runner_controls(monkeypatch, variant=variant, trace_enabled=True)
+    captured: dict[str, object] = {}
+
+    @contextmanager
+    def capture_trace(
+        component,
+        *,
+        batch_phase,
+        consumer_sources,
+        contract_metadata,
+        variant,
+    ):
+        yield
+        captured["batch_phase"] = batch_phase
+        captured["sources"] = dict(consumer_sources)
+        captured["metadata"] = dict(contract_metadata)
+
+    monkeypatch.setattr(model_runner, "trace_output_phase_peak", capture_trace)
+    events: list[str] = []
+    runner = SimpleNamespace(
+        model=_RunnerModel(events),
+        sampler=_RunnerSampler(events, None),
+        rejection_sampler=None,
+    )
+
+    GPUModelRunner.sample(
+        runner,
+        torch.ones(1, 3),
+        _runner_inputs(num_draft_tokens=0, per_request_logits=(1,)),
+        grammar_output=None,
+    )
+
+    assert events == [
+        "batch_phase",
+        "validation",
+        "local_context_enter",
+        "compute_logits",
+        "local_context_exit",
+        "dense_sampler",
+    ]
+    assert captured["batch_phase"] == "prefill_only"
+    assert captured["sources"] == {
+        "sample": "dense_logits",
+        "clean_argmax": "dense_logits",
+        "entropy_remask": "dense_logits",
+        "soft_self_conditioning": "dense_logits",
+    }
+    assert captured["metadata"] == {
+        "effective_variant": "off",
+        "consumer_contract": "vllm_diffusiongemma",
+        "pareto_role": "baseline_context",
+        "pareto_gate_eligible": False,
+    }
+
+
+def test_model_runner_trace_mixed_batch_preserves_selected_attribution(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    variant = "sample_only_dense_consumers"
+    monkeypatch.setenv("VLLM_DIFFUSION_GEMMA_VALIDATION_VARIANT", variant)
+    _set_runner_controls(monkeypatch, variant=variant, trace_enabled=True)
+    captured: dict[str, object] = {}
+
+    @contextmanager
+    def capture_trace(
+        component,
+        *,
+        batch_phase,
+        consumer_sources,
+        contract_metadata,
+        variant,
+    ):
+        yield
+        captured["batch_phase"] = batch_phase
+        captured["metadata"] = dict(contract_metadata)
+
+    monkeypatch.setattr(model_runner, "trace_output_phase_peak", capture_trace)
+    events: list[str] = []
+    runner = SimpleNamespace(
+        model=_RunnerModel(events),
+        sampler=_RunnerSampler(events, _sampler_output(7)),
+        rejection_sampler=None,
+    )
+
+    GPUModelRunner.sample(
+        runner,
+        torch.ones(1, 3),
+        _runner_inputs(per_request_logits=(0, 1)),
+        grammar_output=None,
+    )
+
+    assert events == ["batch_phase", "validation"]
+    assert captured["batch_phase"] == "mixed_prefill_consumer_output"
+    assert captured["metadata"] == {
+        "effective_variant": variant,
+        "consumer_contract": "vllm_diffusiongemma",
+        "pareto_role": "ablation_only",
+        "pareto_gate_eligible": False,
+    }
+
+
+@pytest.mark.parametrize("phase_result", [None, "decode"])
+def test_model_runner_trace_rejects_missing_or_invalid_phase_seam_result(
+    monkeypatch: pytest.MonkeyPatch, phase_result: str | None
+):
+    monkeypatch.setenv("VLLM_DIFFUSION_GEMMA_VALIDATION_VARIANT", "off")
+    _set_runner_controls(monkeypatch, variant="off", trace_enabled=True)
+
+    class InvalidPhaseSampler(_RunnerSampler):
+        def trace_batch_phase(self, input_batch):
+            return phase_result
+
+    runner = SimpleNamespace(
+        model=_RunnerModel([]),
+        sampler=InvalidPhaseSampler([], None),
+        rejection_sampler=None,
+    )
+
+    with pytest.raises(RuntimeError, match="trace_batch_phase.*batch_phase"):
+        GPUModelRunner.sample(
+            runner,
+            torch.ones(1, 3),
+            _runner_inputs(),
+            grammar_output=None,
+        )
+
+
+def test_model_runner_trace_requires_batch_phase_seam(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_DIFFUSION_GEMMA_VALIDATION_VARIANT", "off")
+    _set_runner_controls(monkeypatch, variant="off", trace_enabled=True)
+
+    class MissingPhaseSampler:
+        def __call__(self, *args) -> SamplerOutput:
+            raise AssertionError("missing phase seam must fail before sampling")
+
+    runner = SimpleNamespace(
+        model=_RunnerModel([]),
+        sampler=MissingPhaseSampler(),
+        rejection_sampler=None,
+    )
+
+    with pytest.raises(RuntimeError, match=r"callable sampler\.trace_batch_phase"):
+        GPUModelRunner.sample(
+            runner,
+            torch.ones(1, 3),
+            _runner_inputs(),
+            grammar_output=None,
+        )
 
 
 def test_model_runner_grammar_forces_dense_fallback(
@@ -1101,6 +1441,7 @@ def test_model_runner_peak_trace_wraps_dense_output_head(
     )
 
     assert events == [
+        "batch_phase",
         "sync",
         "reset",
         "local_context_enter",
@@ -1110,6 +1451,7 @@ def test_model_runner_peak_trace_wraps_dense_output_head(
         "sync",
     ]
     record = json.loads((tmp_path / "peak.rank0.jsonl").read_text())
+    assert record["batch_phase"] == "consumer_output_only"
     assert record["consumer_sources"] == {
         "sample": "dense_logits",
         "clean_argmax": "dense_logits",
@@ -1200,6 +1542,7 @@ def test_model_runner_trace_attributes_actual_dense_or_full_state_path(
     )
 
     record = json.loads((tmp_path / "path.rank0.jsonl").read_text())
+    assert record["batch_phase"] == "consumer_output_only"
     assert record["configured_variant"] == "off"
     assert record["variant"] == expected_variant
     assert record["consumer_sources"] == {
@@ -1280,8 +1623,12 @@ def test_trace_consumer_spec_is_per_call_and_full_state_fallback_is_truthful(
     sampler.sampling_states = SimpleNamespace(
         max_num_logprobs=lambda slots: max_num_logprobs["value"]
     )
+    sampler.trace_batch_phase = lambda _: (_ for _ in ()).throw(
+        AssertionError("consumer attribution must reuse the runner's phase probe")
+    )
     input_batch = SimpleNamespace(
         num_reqs=1,
+        num_draft_tokens=3,
         idx_mapping_np=np.array([0]),
         cu_num_logits_np=np.array([0, 3]),
         req_ids=["request"],
@@ -1313,6 +1660,30 @@ def test_trace_consumer_spec_is_per_call_and_full_state_fallback_is_truthful(
     assert dense.as_source_tags() == all_dense
     assert fallback.as_source_tags() == all_dense
     assert full_state.as_source_tags() is not full_state_again.as_source_tags()
+
+
+def test_trace_consumer_spec_preserves_dense_attribution_for_real_prefill(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(diffusion_gemma, "_DIFFUSION_GEMMA_LOCAL_VOCAB_SAMPLER", True)
+    sampler = DiffusionSampler.__new__(DiffusionSampler)
+    sampler.vocab_size = 6
+    sampler.sampling_states = SimpleNamespace(max_num_logprobs=lambda slots: -1)
+    sampler.trace_batch_phase = lambda _: (_ for _ in ()).throw(
+        AssertionError("consumer attribution must not reclassify prefill")
+    )
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        num_draft_tokens=0,
+        idx_mapping_np=np.array([0]),
+        cu_num_logits_np=np.array([0, 1]),
+        req_ids=["request"],
+    )
+
+    spec = sampler.trace_consumer_spec_for_logits(torch.zeros(1, 3), input_batch)
+
+    assert spec.effective_variant == "off"
+    assert set(spec.as_source_tags().values()) == {"dense_logits"}
 
 
 def test_sample_from_hidden_states_routes_sample_only_variant(
@@ -1880,6 +2251,7 @@ def test_real_tp2_validation_variants_preserve_rank_state_and_sources(
     trace_spec = validation_variant_spec("token_axis_logit_microbatch")
     with trace_output_phase_peak(
         "DiffusionGemmaTP2Helper",
+        batch_phase="consumer_output_only",
         consumer_sources=trace_spec.as_source_tags(),
         contract_metadata=trace_spec.as_contract_metadata(),
         variant="token_axis_logit_microbatch",

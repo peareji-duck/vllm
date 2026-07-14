@@ -10,7 +10,7 @@ import threading
 import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import torch
 
@@ -31,6 +31,27 @@ _CONTRACT_METADATA_FIELDS = (
     "pareto_role",
     "pareto_gate_eligible",
 )
+_BATCH_PHASES = (
+    "prefill_only",
+    "consumer_output_only",
+    "mixed_prefill_consumer_output",
+)
+
+
+@runtime_checkable
+class ConsumerStateBatchPhaseProvider(Protocol):
+    """Sampler capability required by opt-in consumer-state tracing."""
+
+    def trace_batch_phase(self, input_batch: Any) -> str: ...
+
+
+def _require_batch_phase(batch_phase: object) -> str:
+    if type(batch_phase) is not str or batch_phase not in _BATCH_PHASES:
+        allowed = ", ".join(_BATCH_PHASES)
+        raise RuntimeError(
+            "Consumer-state trace requires batch_phase to be one of: " + allowed
+        )
+    return batch_phase
 
 
 def peak_memory_trace_path() -> str:
@@ -180,10 +201,34 @@ def require_consumer_state_attribution(
     return consumer_sources, contract_metadata
 
 
+def require_consumer_state_batch_phase(sampler: object, input_batch: Any) -> str:
+    """Resolve a causal batch phase or invalidate the benchmark run."""
+    if not isinstance(sampler, ConsumerStateBatchPhaseProvider):
+        raise RuntimeError(
+            "Consumer-state tracing requires callable "
+            "sampler.trace_batch_phase(); benchmark run is invalid"
+        )
+    try:
+        batch_phase = sampler.trace_batch_phase(input_batch)
+    except Exception as exc:
+        raise RuntimeError(
+            "Consumer-state batch phase seam sampler.trace_batch_phase() failed; "
+            "benchmark run is invalid"
+        ) from exc
+    try:
+        return _require_batch_phase(batch_phase)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "sampler.trace_batch_phase() returned invalid batch_phase; "
+            "benchmark run is invalid"
+        ) from exc
+
+
 def build_output_phase_peak_record(
     *,
     component: str,
     variant: str,
+    batch_phase: str | None = None,
     global_rank: int,
     local_rank: int,
     tp_rank: int,
@@ -197,6 +242,7 @@ def build_output_phase_peak_record(
     consumer_sources: Mapping[str, str] | None = None,
     contract_metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    batch_phase = _require_batch_phase(batch_phase)
     attribution_issue = _consumer_state_attribution_issue(
         consumer_sources, contract_metadata
     )
@@ -209,10 +255,11 @@ def build_output_phase_peak_record(
         else "unattributed"
     )
     record: dict[str, Any] = {
-        "schema_version": 3,
+        "schema_version": 4,
         "timestamp_unix_s": time.time(),
         "framework": "vllm",
         "component": component,
+        "batch_phase": batch_phase,
         "variant": effective_variant,
         "configured_variant": variant,
         "attribution_status": attribution_status,
@@ -258,6 +305,7 @@ def _append_jsonl(path: str, record: Mapping[str, Any]) -> None:
 def trace_output_phase_peak(
     component: str,
     *,
+    batch_phase: str | None = None,
     consumer_sources: Mapping[str, str] | None = None,
     contract_metadata: Mapping[str, Any] | None = None,
     variant: str | None = None,
@@ -268,6 +316,7 @@ def trace_output_phase_peak(
         yield
         return
 
+    batch_phase = _require_batch_phase(batch_phase)
     metadata = _trace_process_metadata()
     path = resolve_rank_trace_path(configured_path, metadata["global_rank"])
     if variant is None:
@@ -290,6 +339,7 @@ def trace_output_phase_peak(
             record = build_output_phase_peak_record(
                 component=component,
                 variant=variant,
+                batch_phase=batch_phase,
                 start_allocated=start_allocated,
                 start_reserved=start_reserved,
                 peak_allocated=torch.cuda.max_memory_allocated(),

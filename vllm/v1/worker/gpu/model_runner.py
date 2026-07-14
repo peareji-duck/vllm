@@ -41,6 +41,7 @@ from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.consumer_state_trace import (
     require_consumer_state_attribution,
+    require_consumer_state_batch_phase,
     trace_output_phase_peak,
 )
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
@@ -1106,9 +1107,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         consumer_sources: dict[str, str] = {}
         contract_metadata: dict[str, str | bool] = {}
         trace_enabled = _CONSUMER_STATE_TRACE_ENABLED
+        batch_phase = (
+            require_consumer_state_batch_phase(self.sampler, input_batch)
+            if trace_enabled
+            else None
+        )
         component = type(self.model).__name__
         with trace_output_phase_peak(
             component,
+            batch_phase=batch_phase,
             consumer_sources=consumer_sources,
             contract_metadata=contract_metadata,
             variant=validation_variant,

@@ -2071,10 +2071,85 @@ class DiffusionSampler:
     def validation_consumer_spec(self) -> ValidationVariantSpec:
         return validation_variant_spec(get_validation_variant())
 
+    def trace_batch_phase(self, input_batch: Any) -> str:
+        """Classify whether this batch invokes DiffusionGemma consumers.
+
+        Positive-logit rows cover both denoise and commit steps. The trace
+        deliberately groups them as consumer output without synchronizing the
+        GPU-resident phase state.
+        """
+        num_reqs = input_batch.num_reqs
+        if isinstance(num_reqs, bool) or not isinstance(num_reqs, (int, np.integer)):
+            raise ValueError("consumer-state batch phase requires integer num_reqs")
+        if num_reqs <= 0:
+            raise ValueError("consumer-state batch phase requires positive num_reqs")
+
+        num_draft_tokens = input_batch.num_draft_tokens
+        if isinstance(num_draft_tokens, bool) or not isinstance(
+            num_draft_tokens, (int, np.integer)
+        ):
+            raise ValueError(
+                "consumer-state batch phase requires integer num_draft_tokens"
+            )
+        if num_draft_tokens < 0:
+            raise ValueError(
+                "consumer-state batch phase requires non-negative num_draft_tokens"
+            )
+
+        cumulative_logits = np.asarray(input_batch.cu_num_logits_np)
+        if cumulative_logits.ndim != 1:
+            raise ValueError(
+                "consumer-state cumulative logits layout must be one-dimensional"
+            )
+        if cumulative_logits.size != num_reqs + 1:
+            raise ValueError(
+                "consumer-state cumulative logits layout must contain exactly "
+                "num_reqs + 1 entries"
+            )
+        if not np.issubdtype(cumulative_logits.dtype, np.signedinteger):
+            raise ValueError(
+                "consumer-state cumulative logits layout must use signed integer values"
+            )
+
+        active_layout = cumulative_logits[: num_reqs + 1].astype(np.int64, copy=False)
+        if active_layout[0] != 0:
+            raise ValueError(
+                "consumer-state cumulative logits layout must start at zero"
+            )
+        per_request_logits = np.diff(active_layout)
+        if np.any(per_request_logits < 0):
+            raise ValueError(
+                "consumer-state cumulative logits layout has negative "
+                "per-request logits"
+            )
+        # Generic no-draft input preparation emits one logit index per request,
+        # but DiffusionGemma exits through its prefill path before using them.
+        if num_draft_tokens == 0:
+            expected_prefill_layout = np.arange(num_reqs + 1, dtype=np.int64)
+            if not np.array_equal(active_layout, expected_prefill_layout):
+                raise ValueError(
+                    "consumer-state no-draft cumulative logits layout must contain "
+                    "one logit index per request"
+                )
+            return "prefill_only"
+        if int(active_layout[-1]) != num_draft_tokens:
+            raise ValueError(
+                "consumer-state cumulative logits total must equal num_draft_tokens"
+            )
+        has_prefill = bool(np.any(per_request_logits == 0))
+        has_consumer_output = bool(np.any(per_request_logits > 0))
+        if has_prefill and has_consumer_output:
+            return "mixed_prefill_consumer_output"
+        if has_consumer_output:
+            return "consumer_output_only"
+        return "prefill_only"
+
     def trace_consumer_spec_for_logits(
         self, logits: torch.Tensor | None, input_batch: Any
     ) -> ValidationVariantSpec:
         """Describe the path this call will take without retaining request state."""
+        if input_batch.num_draft_tokens == 0:
+            return validation_variant_spec("off")
         num_reqs = input_batch.num_reqs
         per_req_nlogits_np = np.diff(input_batch.cu_num_logits_np[: num_reqs + 1])
         num_decode = int(np.count_nonzero(per_req_nlogits_np > 0))
